@@ -1,0 +1,17 @@
+schedule-config.json
+/firefox/dist/
+/safari/build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcarchive/
+*.app/
+*.xpi
+.env
+.env.local
+amo.key
+amo.secret
+*.p12
+*.mobileprovision
+.DS_Store
+Thumbs.db

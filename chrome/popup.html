@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Свободные чаты Школково</title>
+  <link rel="stylesheet" href="popup.css">
+  <script defer src="popup.js"></script>
+</head>
+<body>
+  <main>
+    <h1>Мониторинг чатов</h1>
+    <p id="status" class="status" role="status">Проверяю состояние…</p>
+    <button id="reload-extension" type="button" hidden>Перезагрузить расширение</button>
+    <form id="curator-form" aria-label="Имя и фамилия куратора" hidden>
+      <label for="curator-first-name">Имя</label>
+      <input id="curator-first-name" name="firstName" type="text" autocomplete="given-name" required>
+      <label for="curator-last-name">Фамилия</label>
+      <input id="curator-last-name" name="lastName" type="text" autocomplete="family-name" required>
+      <button id="save-curator" type="submit">Сохранить</button>
+      <p id="curator-feedback" class="note" role="status" hidden></p>
+    </form>
+    <div id="monitor-controls">
+      <p id="connection" class="connection">Статус неизвестен</p>
+      <dl>
+        <div><dt>Состав на час</dt><dd id="period">—</dd></div>
+        <div><dt>Таблица прочитана</dt><dd id="last-read">—</dd></div>
+        <div><dt>В очереди</dt><dd id="pending">0</dd></div>
+        <div><dt>Не определено</dt><dd id="uncertain">0</dd></div>
+        <div><dt>Проверено</dt><dd id="checked">0</dd></div>
+        <div><dt>Уведомлений о чатах</dt><dd id="notified">0</dd></div>
+      </dl>
+      <p id="note" class="note" hidden></p>
+      <div class="shift">
+        <p>Действующих привязок <strong id="bindings">0</strong></p>
+        <details>
+          <summary>Свободные чаты <strong id="free-count">0</strong></summary>
+          <p id="free-empty">Свободных чатов нет.</p>
+          <ul id="free-list" hidden></ul>
+        </details>
+      </div>
+      <div class="settings">
+        <label><input id="senior" type="checkbox" disabled> Режим старшего</label>
+        <p id="mode-status" role="status" hidden></p>
+        <label><input id="pinned-instant" type="checkbox" checked disabled> Мгновенные уведомления о закреплённых чатах</label>
+      </div>
+      <p id="feedback" role="status" hidden></p>
+      <p class="hint">Оставь вкладку проверки в фоне. При открытии переписки сайт может отметить её прочитанной.</p>
+      <button id="toggle" type="button" disabled>Запустить мониторинг</button>
+      <button id="shift-chats" type="button" disabled>Открыть вкладку старшего</button>
+      <button id="test" type="button" disabled>Проверить уведомления</button>
+      <div class="shift">
+        <button id="finish" type="button" disabled>Завершить смену и сбросить привязки</button>
+      </div>
+    </div>
+  </main>
+</body>
+</html>
