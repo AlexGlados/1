@@ -765,6 +765,10 @@
     const pinMessages = newPinnedMessages(c, h, list);
     if (facts.reason || pinMessages.reason) return retry(c, facts.reason || pinMessages.reason, now);
     const { reply, wait, student, lastReplyAt, lastReplyKey } = facts;
+    if (student) {
+      c.lastStudentKey = student.key;
+      c.lastStudentAt = student.at;
+    }
     if (c.pending.reason === 'off-duty-review' && !reply && h.startReached !== true) {
       return retry(c, 'Не подтверждён автор последнего ответа куратора.', now);
     }
@@ -802,10 +806,6 @@
     c.lastMessageKey = last.key;
     c.lastReplyAt = lastReplyAt;
     c.lastReplyKey = lastReplyKey;
-    if (student) {
-      c.lastStudentKey = student.key;
-      c.lastStudentAt = student.at;
-    }
     if (c.pinned && reply) c.cachedPinReply = { at: reply.at, role: reply.role, author: reply.author };
     if (c.waitKey !== wait?.key) c.remindedMinute = 0;
     c.waitKey = wait?.key ?? null;

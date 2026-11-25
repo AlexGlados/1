@@ -9,6 +9,7 @@
   const documentKey = crypto.randomUUID();
   const dom = globalThis.ShkolkovoDom;
   const minute = 60_000;
+  const listWindow = 45 * minute;
   const recentRow = (row, now) => row.precision !== 'day' && dom.isRecent(row.at, now);
   const validPage = () => !pageSuspended && /^\/chat\/?$/u.test(location.pathname);
   const pageListeners = new AbortController();
@@ -163,9 +164,9 @@
     }, delay);
   }
 
-  function reportCoverage(complete, scanned, reason) {
+  function reportCoverage(complete, scanned, reason, retryDelay = 3_000) {
     void send({ type: 'monitor:coverage', session, complete, scanned, total: null, reason, partial: true,
-      ...(!complete ? { retryAt: Date.now() + 3_000 } : {}) });
+      ...(!complete ? { retryAt: Date.now() + retryDelay } : {}) });
   }
 
   function moveList(root, offset, signal) {
@@ -230,45 +231,35 @@
     return false;
   }
 
-  async function captureListPosition(root, total, position, signal, allowed) {
-    if (!allowed() || !await showPosition(root, position, signal, allowed) || !allowed()) return null;
-    const frame = scan();
-    return listRoot === root && frame.ready && frame.layout?.total === total ? frame : null;
-  }
+  async function walkRecentList(root, signal, allowed, visit) {
+    if (!allowed()) return 'interrupted';
+    await moveList(root, 0, signal);
+    let total;
+    let previousLast = 0;
+    while (allowed()) {
+      const frame = scan();
+      if (listRoot !== root || !frame.ready || !frame.layout?.total) return 'interrupted';
+      total ??= frame.layout.total;
+      if (frame.layout.total !== total) return 'interrupted';
+      if (visit(frame)) return 'matched';
+      const first = frame.ordered[0]?.position;
+      const last = frame.ordered.at(-1)?.position;
+      if (!first || first > previousLast + 1 || frame.ordered.length !== frame.layout.positions.length ||
+          frame.ordered.some((row, index) => row.position !== first + index)) return 'interrupted';
 
-  // Shkolkovo sorts pinned chats newest first, unread chats oldest first,
-  // and the remaining chats newest first. Search for the start of the last
-  // group instead of walking through old pinned and unread rows.
-  async function findReadStart(total, capture, initial) {
-    let first = 1;
-    let last = total + 1;
-    let frame = initial;
-    while (frame) {
-      for (const row of frame.ordered) {
-        if (row.group === 'read') last = Math.min(last, row.position);
-        else first = Math.max(first, row.position + 1);
-      }
-      if (first > last) return null;
-      if (first === last) return first;
-      const target = Math.floor((first + last) / 2);
-      frame = await capture(target);
-      if (frame && !frame.ordered.some(row => row.position === target)) return null;
+      const edge = frame.ordered.at(-1);
+      const old = edge.precision === 'day' || frame.observedAt - edge.at >= listWindow;
+      if (last === total || (old && edge.group === 'read')) return 'complete';
+      // Older pinned or unread rows can precede a separate recent group. The
+      // virtual list does not expose that group's position before rendering it.
+      if (old) return 'time-limit';
+      const offset = root.scrollTop;
+      if (root.clientHeight <= 0) return 'interrupted';
+      previousLast = last;
+      await moveList(root, offset + root.clientHeight * 0.75, signal);
+      if (root.scrollTop <= offset) return 'interrupted';
     }
-    return null;
-  }
-
-  async function visitRecentBand(position, group, direction, total, capture) {
-    while (position >= 1 && position <= total) {
-      const snapshot = await capture(position);
-      if (!snapshot) return false;
-      const row = snapshot.ordered.find(row => row.position === position);
-      if (!row) return false;
-      if (row.group !== group || !recentRow(row, snapshot.observedAt)) return true;
-      const edge = direction === 1 ? snapshot.ordered.at(-1) : snapshot.ordered[0];
-      if (edge.group !== group || !recentRow(edge, snapshot.observedAt)) return true;
-      position = edge.position + direction;
-    }
-    return true;
+    return 'interrupted';
   }
 
   function rememberRows(found, conflicts, snapshot) {
@@ -303,41 +294,33 @@
         return;
       }
       const root = listRoot;
-      const total = snapshot.layout.total;
       const found = new Map();
       const conflicts = new Set();
       const available = () => alive() && root.isConnected;
-      const capture = async position => {
-        const frame = await captureListPosition(root, total, position, controller.signal, available);
-        if (frame) rememberRows(found, conflicts, frame);
-        return frame;
-      };
-      await moveList(root, 0, controller.signal);
-      if (!available()) return;
-      snapshot = scan();
-      rememberRows(found, conflicts, snapshot);
-      const firstRead = total && snapshot.ready && snapshot.layout?.total === total
-        ? await findReadStart(total, capture, snapshot) : null;
-      const complete = firstRead !== null &&
-        await visitRecentBand(1, 'pinned', 1, total, capture) &&
-        await visitRecentBand(firstRead - 1, 'unread', -1, total, capture) &&
-        await visitRecentBand(firstRead, 'read', 1, total, capture);
+      const outcome = await walkRecentList(root, controller.signal, available,
+        frame => rememberRows(found, conflicts, frame));
       if (controller.signal.aborted || session !== startedSession || !canInspect()) return;
       if (root.isConnected) await moveList(root, 0, controller.signal);
-      if (controller.signal.aborted || session !== startedSession) return;
-      if (complete) ambiguous.clear();
+      if (controller.signal.aborted || session !== startedSession || !canInspect()) return;
+      snapshot = scan();
+      if (listRoot !== root) return;
+      rememberRows(found, conflicts, snapshot);
+      if (outcome !== 'interrupted') ambiguous.clear();
       for (const key of conflicts) ambiguous.add(key);
       positions.clear();
       const observedAt = Date.now();
       const rows = [...found.values()].filter(row => !ambiguous.has(row.id) && dom.isRecent(row.at, observedAt));
       for (const row of rows) positions.set(row.id, row.position);
-      await publish({ ready: snapshot.ready, observedAt, rows, partial: true });
-      result = complete ? [true, rows.length] : [false, rows.length, 'Не удалось обновить все свежие чаты.'];
-      if (complete) delay = 60_000;
+      await publish({ ready: snapshot.ready || rows.length > 0, observedAt, rows, partial: true });
+      const reason = outcome === 'time-limit' ? 'Прокрутка остановлена на временной границе 45 минут.'
+        : 'Не удалось обновить все свежие чаты.';
+      result = [outcome === 'complete', rows.length, reason];
+      if (outcome !== 'interrupted') delay = 60_000;
     } finally {
       if (activeSweep === controller) activeSweep = null;
       if (session !== startedSession) return;
-      if (result) reportCoverage(...result);
+      if (result) reportCoverage(...result, delay);
+      scheduleCapture();
       scheduleSweep(delay);
     }
   }
@@ -411,37 +394,22 @@
       if (Number.isSafeInteger(row.position) && row.position > 0) positions.set(id, row.position);
       return row;
     };
-    for (const hint of new Set([positions.get(id), position])) {
-      if (!alive()) return null;
-      if (!Number.isSafeInteger(hint) || hint < 1) continue;
-      await showPosition(root, hint, signal, alive);
-      const match = matchingRow();
-      if (match) return match;
-    }
-
-    // A message or unread change can move a chat to a different part of the list.
-    // Locate its key in the recent bands and stop as soon as its live row is rendered.
-    if (!alive()) return null;
-    const initial = scan();
-    const total = initial.layout?.total;
-    if (listRoot !== root || !initial.ready || !total) return null;
     let match = matchingRow();
     if (match) return match;
-    const capture = async target => {
-      if (match) return null;
-      const frame = await captureListPosition(root, total, target, signal, alive);
-      if (frame) match = matchingRow();
-      return frame;
-    };
-    const firstRead = await findReadStart(total, capture, initial);
-    if (match) return match;
-    if (firstRead !== null) {
-      await visitRecentBand(firstRead - 1, 'unread', -1, total, capture);
-      if (match) return match;
-      await visitRecentBand(firstRead, 'read', 1, total, capture);
-      if (match) return match;
+    if (!recentOnly) {
+      // A user can explicitly open a known chat outside the automatic scan.
+      for (const hint of new Set([positions.get(id), position])) {
+        if (!alive()) return null;
+        if (!Number.isSafeInteger(hint) || hint < 1) continue;
+        await showPosition(root, hint, signal, alive);
+        match = matchingRow();
+        if (match) return match;
+      }
     }
-    await visitRecentBand(1, 'pinned', 1, total, capture);
+    await walkRecentList(root, signal, alive, () => {
+      match = matchingRow();
+      return Boolean(match);
+    });
     return match;
   }
 
@@ -616,7 +584,13 @@
         ...(typeof latest.assignedToSelf === 'boolean' ? { assignedToSelf: latest.assignedToSelf } : {}),
         complete: coveredEpisode(latest), sinceCovered: coveredPin(latest), messages };
     } finally {
-      if (activeRead === controller) activeRead = null;
+      if (activeRead === controller) {
+        const root = dom.getVirtualList?.();
+        if (root && !controller.signal.aborted && session === request.session && canInspect()) {
+          await moveList(root, 0, controller.signal).catch(() => {});
+        }
+        activeRead = null;
+      }
       scheduleSweep();
     }
   }

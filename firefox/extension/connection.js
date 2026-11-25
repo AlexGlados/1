@@ -1,6 +1,7 @@
 (() => {
   'use strict';
 
+  const offlineDelay = 2_000;
   const connectingDelay = 30_000;
   const failedAlertRetry = 30_000;
 
@@ -9,6 +10,7 @@
     let episode = 0;
     let status = null;
     let visibleStatus = null;
+    let onlineSeen = false;
     let failed = false;
     let sent = false;
     let sending = false;
@@ -48,7 +50,12 @@
       failed = false;
       sent = false;
       sending = false;
-      due = next === 'offline' ? now : next === 'connecting' ? now + connectingDelay : Infinity;
+      due = now + alertDelay(next);
+    }
+
+    function alertDelay(next) {
+      if (next === 'offline' && onlineSeen) return offlineDelay;
+      return next === 'connecting' ? connectingDelay : Infinity;
     }
 
     function refresh() {
@@ -73,8 +80,9 @@
         clearTimer();
         return;
       }
+      if (next === 'online') onlineSeen = true;
       if (next !== status) transition(next, now);
-      else if (!previousVisible && next === 'connecting' && !sent && !sending && !failed) due = now + connectingDelay;
+      else if (!previousVisible && !sent && !sending && !failed) due = now + alertDelay(next);
       if (sent || sending || !Number.isFinite(due)) return;
       if (now < due) schedule(now);
       else {
@@ -89,7 +97,7 @@
       try {
         ok = (await send(currentStatus))?.ok === true;
       } catch {
-        // Keep observing and retry if Firefox could not show the notification.
+        // Keep observing and retry if the background script did not accept the alert.
       }
       if (!active || currentEpisode !== episode) return;
       sending = false;
@@ -110,6 +118,7 @@
 
     function stop() {
       active = false;
+      onlineSeen = false;
       transition(null, Date.now());
       visibleStatus = null;
       observer.disconnect();

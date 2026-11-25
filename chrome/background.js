@@ -22,7 +22,7 @@ const token = state => String(state.scan.generation);
 const monitoring = state => state.scan.enabled && Boolean(state.scan.curatorName);
 const curatorRequiredMessage = 'Введи имя и фамилию куратора в меню расширения.';
 const commandTimeout = { 'monitor:read': 28_000, 'monitor:open': 17_000 };
-const blankConnection = () => ({ status: 'unknown', episode: '', since: 0, alerted: false });
+const blankConnection = () => ({ status: 'unknown', episode: '', since: 0, alerted: false, onlineSeen: false });
 function blank() {
   return { scan: E.fresh(), tab: null, lastWatchTab: null, boot: null, ownedTab: true, doc: null, ready: false, capturedHandoff: null,
     coverage: null, connection: blankConnection(), syncAt: 0, curatorSyncAt: null,
@@ -178,20 +178,26 @@ function removeNotice(s, id) {
   delete s.outbox[id];
   if (!Object.values(s.outbox).some(n => n.retryAt > 0)) s.error = '';
 }
+function connectionDelay(connection) {
+  if (connection.status === 'offline' && connection.onlineSeen) return 2_000;
+  return connection.status === 'connecting' ? 30_000 : Infinity;
+}
 function connection(s, status, verified = false) {
   if (!['unknown', 'online', 'offline', 'connecting'].includes(status)) return;
   const c = s.connection;
   const previous = c.status;
+  c.onlineSeen ??= previous === 'online' && s.ready;
   c.status = status;
+  if (status === 'online' && s.ready) c.onlineSeen = true;
   if (status === 'unknown') return;
+  const now = Date.now();
   if (c.episode !== status) {
     c.episode = status;
-    c.since = Date.now();
+    c.since = now;
     c.alerted = false;
-  } else if (previous === 'unknown' && status === 'connecting' && !c.alerted) c.since = Date.now();
-  if (c.alerted || (status !== 'offline' &&
-      !(status === 'connecting' && verified && Date.now() - c.since >= 30_000))) return;
-  addNotice(s, { kind: status, since: c.since });
+  } else if (previous === 'unknown' && !c.alerted) c.since = now;
+  if (!s.doc || c.alerted || !verified || now - c.since < connectionDelay(c)) return;
+  addNotice(s, { kind: status, since: c.since, doc: s.doc });
   c.alerted = true;
 }
 
@@ -231,7 +237,7 @@ async function alarm(name, when) {
 function eligible(s, n) {
   if (!monitoring(s) || n.tab !== s.tab || n.session !== token(s)) return false;
   if (n.kind === 'offline' || n.kind === 'connecting') {
-    return n.kind === s.connection.episode && n.since === s.connection.since;
+    return Boolean(s.doc && n.doc === s.doc && n.kind === s.connection.status && n.since === s.connection.since);
   }
   return E.noticeEligible(s.scan, n, Date.now());
 }
@@ -310,11 +316,13 @@ async function plan() {
       actions.push(() => sync(ref));
     }
     if (s.syncAt > now) times.push(s.syncAt);
-    if (s.doc && !runningProbe && s.connection.status === 'connecting' && !s.connection.alerted) {
-      const due = Math.max(s.connection.since + 30_000, retryWake);
+    const c = s.connection;
+    if (s.doc && !runningProbe && !c.alerted) {
+      const due = Math.max(c.since + connectionDelay(c), retryWake);
       if (now >= due) {
-        runningProbe = ref;
-        actions.push(() => probe(ref));
+        const probeRef = { ...ref, status: c.status, since: c.since };
+        runningProbe = probeRef;
+        actions.push(() => probe(probeRef));
       } else times.push(due);
     }
     if (s.ready && s.doc && !runningSync && !runningRead && !handoffCapture) {
@@ -431,7 +439,11 @@ async function sync(ref) {
 async function probe(ref) {
   try {
     const reply = await send(ref.tab, { type: 'monitor:snapshot', session: ref.session }, ref.doc);
-    await tx(s => { if (current(s, ref)) connection(s, reply?.connection || 'unknown', true); });
+    await tx(s => {
+      if (current(s, ref) && s.connection.status === ref.status && s.connection.since === ref.since) {
+        connection(s, reply?.connection || 'unknown', true);
+      }
+    });
   } catch { /* Keep the episode pending until the document is available. */ }
   finally {
     if (runningProbe === ref) { retryWake = Date.now() + 3000; runningProbe = null; }
@@ -478,6 +490,18 @@ async function deliver(id) {
           return;
         }
         if (!Object.hasOwn(existing, id)) {
+          if (n.kind === 'offline') {
+            const tab = await chrome.tabs.get(n.tab).catch(() => null);
+            if (!tab || tab.status === 'loading') {
+              removeNotice(s, id);
+              return;
+            }
+            const snapshot = await send(n.tab, { type: 'monitor:snapshot', session: n.session }, n.doc);
+            if (snapshot?.connection !== 'offline') {
+              removeNotice(s, id);
+              return;
+            }
+          }
           const latest = { ...n };
           if (n.kind === 'handover') latest.count = handoverCount(s.scan, now);
           if (n.phase === 'reminder' && Number.isFinite(n.at)) latest.minutes = Math.max(0, Math.floor((now - n.at) / MIN));
@@ -503,7 +527,7 @@ async function tabMessage(m, sender) {
       if (s.doc !== sender.documentId) {
         s.doc = sender.documentId;
         s.ready = false;
-        s.connection.status = 'unknown';
+        s.connection = blankConnection();
       }
       return { session: token(s), generation: s.scan.generation, curatorName: s.scan.curatorName };
     }
@@ -514,6 +538,7 @@ async function tabMessage(m, sender) {
         if (!Array.isArray(m.rows)) return { ok: false };
         addRows(s, m);
         s.ready = true;
+        if (s.connection.status === 'online') s.connection.onlineSeen = true;
         break;
       case 'monitor:coverage': {
         if (typeof m.complete !== 'boolean') return { ok: false };
@@ -620,7 +645,7 @@ async function shiftMessage(m) {
   if (m.type === 'shift:status') {
     const result = await tx(s => ({ ...summary(s), occupied: Object.values(s.scan.chats).filter(c => c.binding).map(c => ({
       id: c.id, title: c.title, curator: c.binding.curator, bindingPeriod: c.binding.period, activityAt: occupiedActivity(c),
-      lastMessageAt: c.lastMessageAt ?? c.checked?.at ?? null, lastCuratorAt: c.lastReplyAt ?? c.binding.replyAt ?? null,
+      lastStudentAt: c.lastStudentAt ?? null, lastCuratorAt: c.lastReplyAt ?? c.binding.replyAt ?? null,
       ...waiting(c, Date.now()), muted: !!c.muted, available: Boolean(s.scan.curatorName && E.navigation(s.scan, c.id))
     })) }));
     kick();
@@ -765,7 +790,7 @@ chrome.tabs.onRemoved.addListener(id => {
 });
 chrome.tabs.onUpdated.addListener((id, change) => {
   if (change.status === 'loading') void tx(s => {
-    if (s.tab === id) { s.ready = false; s.doc = null; s.connection.status = 'unknown'; }
+    if (s.tab === id) { s.ready = false; s.doc = null; s.connection = blankConnection(); }
   }).then(kick, failed);
 });
 chrome.notifications.onClosed.addListener(id => { void tx(s => { delete s.routes[id]; }).catch(failed); });

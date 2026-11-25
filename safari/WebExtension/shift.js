@@ -3,6 +3,7 @@
   const storageKey = 'shkolkovo.monitor.v2';
   const minute = 60_000;
   const hour = 60 * minute;
+  const waitingLimit = 6 * minute;
   const dates = new Intl.DateTimeFormat('ru-RU', {
     timeZone: 'Europe/Moscow', day: '2-digit', month: '2-digit', year: 'numeric'
   });
@@ -15,26 +16,28 @@
     ? times.format(value) : dates.format(value) + ' · ' + times.format(value);
   // Moscow's whole-hour offset aligns its :00 boundaries with UTC epoch hours.
   const hourStart = now => Math.floor(now / hour) * hour;
-  const activeInHour = (row, start) => Number.isFinite(row.activityAt) && row.activityAt >= start && row.activityAt < start + hour;
+  const visibleAt = (row, start, now) => Number.isFinite(row.activityAt) && row.activityAt >= start &&
+    row.activityAt < start + hour && (!Number.isFinite(row.waitingSince) || now <= row.waitingSince + waitingLimit);
 
   function shiftGroups(occupied, now) {
     const groups = new Map();
     const start = hourStart(now);
     let refreshAt = start + hour;
     for (const row of occupied) {
-      if (!row.curator || !activeInHour(row, start)) continue;
+      if (!row.curator || !visibleAt(row, start, now)) continue;
       const key = nameKey(row.curator);
       if (!groups.has(key)) groups.set(key, { title: row.curator, rows: [] });
       const waiting = Number.isFinite(row.waitingSince);
       const waitMinutes = waiting ? Math.max(0, Math.floor((now - row.waitingSince) / minute)) : null;
-      if (waiting) refreshAt = Math.min(refreshAt, row.waitingSince + (waitMinutes + 1) * minute);
+      if (waiting) refreshAt = Math.min(refreshAt, row.waitingSince + (waitMinutes + 1) * minute,
+        row.waitingSince + waitingLimit + 1);
       groups.get(key).rows.push({ ...row, waitMinutes });
     }
     const sorted = Array.from(groups.values()).sort((a, b) => collator.compare(a.title, b.title));
     for (const group of sorted) {
       group.rows.sort((a, b) =>
         ((a.waitingSince ?? Infinity) - (b.waitingSince ?? Infinity)) ||
-        ((b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0)) ||
+        ((b.lastStudentAt ?? 0) - (a.lastStudentAt ?? 0)) ||
         collator.compare(a.title, b.title) || collator.compare(a.id, b.id));
     }
     return { groups: sorted, refreshAt, start };
@@ -102,7 +105,7 @@
     section.append(heading);
     const table = node('table');
     table.setAttribute('aria-label', group.title);
-    const labels = ['Чат', 'Последнее сообщение', 'Ответ куратора', 'Ожидание', 'Действия'];
+    const labels = ['Чат', 'Последнее сообщение ученика', 'Ответ куратора', 'Ожидание', 'Действия'];
     const header = table.createTHead().insertRow();
     for (const label of labels) {
       const th = node('th', label);
@@ -113,7 +116,7 @@
     for (const row of group.rows) {
       const line = body.insertRow();
       line.insertCell().append(actionButton(row.id, 'open', row.title, '', 'chat', row.available === false));
-      line.append(timeCell(row.lastMessageAt, labels[1], now), timeCell(row.lastCuratorAt, labels[2], now));
+      line.append(timeCell(row.lastStudentAt, labels[1], now), timeCell(row.lastCuratorAt, labels[2], now));
       const waiting = line.insertCell();
       waiting.dataset.label = labels[3];
       waiting.className = 'duration';
@@ -185,7 +188,7 @@
 
   const extension = globalThis.browser ?? globalThis.chrome;
   if (!extension?.runtime?.id || !extension.storage?.onChanged) {
-    el('monitor-state').textContent = 'Открой вкладку старшего из меню расширения в Safari.';
+    el('monitor-state').textContent = 'Открой вкладку старшего из меню расширения.';
     return;
   }
   const refresh = observeStatus(extension, draw, error => {
@@ -205,7 +208,8 @@
     const { chat: id, action } = button.dataset;
     if (inFlight.has(id) || (action === 'open' && navigating)) return;
     const row = lastSnapshot?.occupied?.find(chat => chat.id === id);
-    if (!row || !activeInHour(row, hourStart(Date.now()))) return;
+    const now = Date.now();
+    if (!row || !visibleAt(row, hourStart(now), now)) return;
     const message = { type: 'shift:' + action, id };
     if (action !== 'open') {
       message.expectedCurator = row.curator;
