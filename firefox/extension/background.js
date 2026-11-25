@@ -610,7 +610,7 @@ function coverageLabel(s) {
     retryAt > Date.now() ? 'Повтор в ' + timeLabel(retryAt) + '.' : 'Проверка продолжится.'].filter(Boolean).join(' ');
 }
 function waiting(c, now) {
-  const since = Number.isFinite(c.waitSince) ? c.waitSince : null;
+  const since = E.waitingSince(c, now);
   return { waitingSince: since, waitMs: since === null ? null : Math.max(0, now - since) };
 }
 async function details(tabId) {

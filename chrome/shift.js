@@ -3,7 +3,6 @@
   const storageKey = 'shkolkovo.monitor.v2';
   const minute = 60_000;
   const hour = 60 * minute;
-  const waitingLimit = 6 * minute;
   const dates = new Intl.DateTimeFormat('ru-RU', {
     timeZone: 'Europe/Moscow', day: '2-digit', month: '2-digit', year: 'numeric'
   });
@@ -16,21 +15,19 @@
     ? times.format(value) : dates.format(value) + ' · ' + times.format(value);
   // Moscow's whole-hour offset aligns its :00 boundaries with UTC epoch hours.
   const hourStart = now => Math.floor(now / hour) * hour;
-  const visibleAt = (row, start, now) => Number.isFinite(row.activityAt) && row.activityAt >= start &&
-    row.activityAt < start + hour && (!Number.isFinite(row.waitingSince) || now <= row.waitingSince + waitingLimit);
+  const activeInHour = (row, start) => Number.isFinite(row.activityAt) && row.activityAt >= start && row.activityAt < start + hour;
 
   function shiftGroups(occupied, now) {
     const groups = new Map();
     const start = hourStart(now);
     let refreshAt = start + hour;
     for (const row of occupied) {
-      if (!row.curator || !visibleAt(row, start, now)) continue;
+      if (!row.curator || !activeInHour(row, start)) continue;
       const key = nameKey(row.curator);
       if (!groups.has(key)) groups.set(key, { title: row.curator, rows: [] });
       const waiting = Number.isFinite(row.waitingSince);
       const waitMinutes = waiting ? Math.max(0, Math.floor((now - row.waitingSince) / minute)) : null;
-      if (waiting) refreshAt = Math.min(refreshAt, row.waitingSince + (waitMinutes + 1) * minute,
-        row.waitingSince + waitingLimit + 1);
+      if (waiting) refreshAt = Math.min(refreshAt, row.waitingSince + (waitMinutes + 1) * minute);
       groups.get(key).rows.push({ ...row, waitMinutes });
     }
     const sorted = Array.from(groups.values()).sort((a, b) => collator.compare(a.title, b.title));
@@ -208,8 +205,7 @@
     const { chat: id, action } = button.dataset;
     if (inFlight.has(id) || (action === 'open' && navigating)) return;
     const row = lastSnapshot?.occupied?.find(chat => chat.id === id);
-    const now = Date.now();
-    if (!row || !visibleAt(row, hourStart(now), now)) return;
+    if (!row || !activeInHour(row, hourStart(Date.now()))) return;
     const message = { type: 'shift:' + action, id };
     if (action !== 'open') {
       message.expectedCurator = row.curator;

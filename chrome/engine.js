@@ -5,6 +5,7 @@
   const MIN = 60_000;
   const HOUR = 60 * MIN;
   const RECENT_MAX_AGE = 20 * MIN; // Matches the recent list limit in dom.js.
+  const WAIT_MAX_AGE = 12 * HOUR;
   const minute = at => Math.floor(at / MIN) * MIN;
   // Moscow is UTC+3, an integral number of hours. Epoch-hour boundaries coincide.
   const periodAt = now => Math.floor((now + 5 * MIN) / HOUR) * HOUR;
@@ -18,6 +19,12 @@
   function recent(at, now) {
     return Number.isFinite(at) && at <= now && now - at < RECENT_MAX_AGE;
   }
+  function tooOld(at, now) {
+    return Number.isFinite(at) && now - at > WAIT_MAX_AGE;
+  }
+  function waitingSince(c, now) {
+    return Number.isFinite(c.waitSince) && !tooOld(c.waitSince, now) ? c.waitSince : null;
+  }
   const hasChecked = c => c.checked && c.checked.at === c.at && c.checked.signal === c.signal;
 
   function fresh() {
@@ -25,7 +32,7 @@
       roster: null, directory: [], appliedPeriod: null, prepared: null,
       prefetchError: '', prefetchRetryAt: 0, scheduleError: '', scheduleRetryAt: 0, scheduleReadAt: null,
       mode: 'normal', pinnedImmediate: true, curatorName: '', startedAt: null, startTarget: null,
-      coveragePending: false, handover: null, chats: {}, dismissedFree: {}, offDutyReviewQueued: true };
+      coveragePending: false, handover: null, chats: {}, dismissedFree: {}, inactiveRows: {}, offDutyReviewQueued: true };
   }
 
   function start(s, now) {
@@ -86,7 +93,15 @@
     for (const [id, removed] of Object.entries(s.dismissedFree ?? {})) {
       if (removed.at <= now - RECENT_MAX_AGE) delete s.dismissedFree[id];
     }
+    for (const [id, removed] of Object.entries(s.inactiveRows ?? {})) {
+      if (Math.max(removed.at, removed.rowAt) <= now - RECENT_MAX_AGE) delete s.inactiveRows[id];
+    }
     for (const c of Object.values(s.chats)) {
+      if (tooOld(c.lastStudentAt, now) && tooOld(c.at, now) &&
+          (!Number.isFinite(c.lastMessageAt) || tooOld(c.lastMessageAt, now))) {
+        delete s.chats[c.id];
+        continue;
+      }
       if (c.transferAt != null && c.transferConfirmed !== true) {
         c.transferReviewAt = c.transferAt;
         c.transferAt = c.freeSince = null;
@@ -101,6 +116,9 @@
       if (c.pending && (!inWindow(c, now) || !inWindow(c, c.pending.due))) {
         c.pending = null;
         c.serial++;
+      }
+      if (!c.pending && tooOld(c.waitSince, now) && (s.mode === 'senior' || !c.binding || canNotifyPinned(s, c))) {
+        enqueue(c, now, 'waiting-review', false, true);
       }
       if (c.transferReviewAt != null && !inWindow(c, now)) clearTransfer(c);
     }
@@ -316,7 +334,7 @@
   }
   function isFree(c, now) {
     return c?.status === 'Свободен' && !c.binding && !c.pinnedColleague && !c.activityDirty &&
-      Boolean(c.waitKey) && Number.isFinite(c.freeSince) && recent(c.lastMessageAt, now) &&
+      Boolean(c.waitKey) && waitingSince(c, now) !== null && Number.isFinite(c.freeSince) && recent(c.lastMessageAt, now) &&
       (c.transferAt == null || c.transferConfirmed === true);
   }
   function freeVersion(c) {
@@ -326,22 +344,26 @@
     const c = getChat(s, id);
     if (!isFree(c, now) || freeVersion(c) !== version) return false;
     s.dismissedFree ??= {};
-    Object.defineProperty(s.dismissedFree, id, { enumerable: true, writable: true, configurable: true, value: {
-      at: c.lastMessageAt, rowAt: c.at, key: c.lastMessageKey, signal: c.lastCheckedMessageId,
+    rememberRemoved(s.dismissedFree, c, c.lastMessageAt, c.lastMessageKey, c.lastCheckedMessageId);
+    delete s.chats[id];
+    return true;
+  }
+  function rememberRemoved(markers, c, at, key, signal) {
+    Object.defineProperty(markers, c.id, { enumerable: true, writable: true, configurable: true, value: {
+      at, rowAt: c.at, key, signal,
       unread: c.unread === true, serial: c.serial,
       aliases: [...new Set([c.rowKey, c.nativeKey, c.fallbackKey].filter(Boolean))]
     } });
-    delete s.chats[id];
-    return true;
   }
   function dismissal(s, id) {
     return Object.hasOwn(s.dismissedFree ?? {}, id) ? s.dismissedFree[id] : null;
   }
-  function observedDismissal(s, row, canonical) {
-    if (canonical) return dismissal(s, canonical);
-    const exact = dismissal(s, row.id);
-    if (exact) return exact;
-    const matches = Object.values(s.dismissedFree ?? {}).filter(marker => marker.aliases.includes(row.id));
+  function observedMarker(markers, row, canonical) {
+    if (!markers) return null;
+    const id = canonical || row.id;
+    if (Object.hasOwn(markers, id)) return markers[id];
+    if (canonical) return null;
+    const matches = Object.values(markers).filter(marker => marker.aliases.includes(row.id));
     return matches.length === 1 ? matches[0] : null;
   }
   function mayHaveNewActivity(marker, row) {
@@ -472,9 +494,11 @@
       if (matching.length > 1 && !canonical) continue; // A name shared by two known IDs cannot identify a row.
       if (identity && matching.length === 1 && matching[0].id !== canonical) identify(s, matching[0], identity);
       const prior = (canonical && getChat(s, canonical)) || matching[0];
-      const removed = prior ? null : observedDismissal(s, row, canonical);
-      if (!prior && (!inWindow(row, now) || (removed && !mayHaveNewActivity(removed, row)))) continue;
-      let c = prior || track(s, { ...row, id: canonical || row.id }, now, removed);
+      const dismissed = prior ? null : observedMarker(s.dismissedFree, row, canonical);
+      const inactive = prior ? null : observedMarker(s.inactiveRows, row, canonical);
+      if (!prior && (!inWindow(row, now) || (dismissed && !mayHaveNewActivity(dismissed, row)) ||
+          (inactive && !mayHaveNewActivity(inactive, row)))) continue;
+      let c = prior || track(s, { ...row, id: canonical || row.id }, now, inactive || dismissed);
       if (identity) c = identify(s, c, identity);
       c.rowKey = row.id; // Navigation always uses the current document's row key.
       if (Number.isInteger(row.position) && row.position > 0) c.rowPosition = row.position;
@@ -666,7 +690,7 @@
     c.status = 'Занят';
   }
 
-  function historyFacts(c, h, messages) {
+  function historyFacts(c, h, messages, now) {
     const replyIndex = messages.findLastIndex(isReply);
     const reply = messages[replyIndex];
     const afterReply = messages.slice(replyIndex + 1);
@@ -676,12 +700,22 @@
     const last = messages.at(-1);
     if (afterReply.some(m => !knownRole(m))) return { reason: 'Не удалось однозначно определить автора сообщения.' };
     const first = afterReply.find(asks);
-    if ((first || c.waitKey) && !reply && !atStart && !continuing) {
-      return { reason: 'Не подтверждено начало истории или последний ответ куратора.' };
+    const needsHistory = (first || c.waitKey) && !reply && !atStart && !continuing;
+    let wait = continuing && !reply && !atStart ? messages[waitIndex] : first;
+    if (needsHistory) {
+      if (c.waitKey && Number.isFinite(c.lastMessageAt) && tooOld(c.waitSince, now)) {
+        // The previous check established an outlier. A known recent question
+        // in an otherwise verified tail gives a conservative new baseline.
+        wait = afterReply.find(message => asks(message) && now - message.at <= RECENT_MAX_AGE);
+      } else wait = null;
+      if (!wait) return { reason: 'Не подтверждено начало истории или последний ответ куратора.' };
+    } else if (tooOld(wait?.at, now)) {
+      const confirmed = continuing && messages[waitIndex];
+      // Keep a replacement already confirmed for this unanswered episode.
+      wait = confirmed && asks(confirmed) && !tooOld(confirmed.at, now) ? confirmed
+        : afterReply.find(message => asks(message) && now - message.at <= RECENT_MAX_AGE);
     }
-    const wait = continuing && !reply && !atStart ? messages[waitIndex] : first;
-    const student = messages.findLast(m => m.role === 'student');
-    return { reply, last, wait, student, continuing,
+    return { reply, last, wait, continuing,
       lastReplyAt: reply?.at ?? (atStart ? null : c.lastReplyAt ?? null),
       lastReplyKey: reply?.key ?? (atStart ? null : c.lastReplyKey ?? null) };
   }
@@ -761,10 +795,19 @@
     if (participant && (!Number.isFinite(c.lastParticipantAt) || participant.at > c.lastParticipantAt)) {
       c.lastParticipantAt = participant.at;
     }
-    const facts = historyFacts(c, h, list);
+    const studentIndex = list.findLastIndex(message => message.role === 'student');
+    const student = list[studentIndex];
+    if (tooOld(student?.at, now) && list.slice(studentIndex + 1).every(knownRole)) {
+      s.inactiveRows ??= {};
+      rememberRemoved(s.inactiveRows, c, last.at, last.key, last.id == null ? c.signal : String(last.id));
+      delete s.chats[c.id];
+      return [];
+    }
+    if (student && !tooOld(student.at, now) && Object.hasOwn(s.inactiveRows ?? {}, c.id)) delete s.inactiveRows[c.id];
+    const facts = historyFacts(c, h, list, now);
     const pinMessages = newPinnedMessages(c, h, list);
     if (facts.reason || pinMessages.reason) return retry(c, facts.reason || pinMessages.reason, now);
-    const { reply, wait, student, lastReplyAt, lastReplyKey } = facts;
+    const { reply, wait, lastReplyAt, lastReplyKey } = facts;
     if (student) {
       c.lastStudentKey = student.key;
       c.lastStudentAt = student.at;
@@ -874,7 +917,7 @@
   }
 
   function policy(s, c, now) {
-    if (c.transferAt != null || c.activityDirty || c.dismissedFree || !c.waitKey || !Number.isFinite(c.waitSince) ||
+    if (c.transferAt != null || c.activityDirty || c.dismissedFree || !c.waitKey || waitingSince(c, now) === null ||
         !recent(c.lastMessageAt, now)) return null;
     if (s.mode === 'senior') {
       if (c.binding && !c.muted) return { kind: 'senior', first: 6, every: 2 };
@@ -980,7 +1023,7 @@
   const api = { fresh, start, stop, finish, advance, periodAt, boundary, prefetchTime, scheduleTarget, installRoster,
     observe, reconcileRows, panelChanged, earliest, next, defer, apply, navigation,
     setMode, setPinnedInstant, dueNotices, nextNoticeAt, noticeEligible, setChatMute, unbind, isFree, freeVersion, dismissFree,
-    isRecentChat: inWindow };
+    waitingSince, isRecentChat: inWindow };
   globalThis.ChatEngine = api;
   if (typeof module !== 'undefined') module.exports = api;
 })();

@@ -563,7 +563,8 @@
           (message.id === job.cursorSignal || 'id:' + message.id === job.cursorKeys?.at(-1)));
       const coveredEpisode = value => value.historyComplete || value.messages.some(message =>
         message.kind === 'curator' || message.kind === 'own' || (message.id && 'id:' + message.id === job.waitKey));
-      for (let page = 0; !(coveredPin(chat) && coveredEpisode(chat)) && page < 8; page++) {
+      const coveredStudent = value => value.historyComplete || value.messages.some(message => message.kind === 'student');
+      for (let page = 0; !(coveredPin(chat) && coveredEpisode(chat) && coveredStudent(chat)) && page < 8; page++) {
         if (controller.signal.aborted || !allowed() || Date.now() >= expiresAt - 4_500 || !chat.loadMore?.isConnected) break;
         chat.loadMore.click();
         const more = await waitPanel(row, chat.id, controller, chat, null, allowed);
