@@ -1,4 +1,5 @@
 :root {
+  width: 344px;
   font-family: "Segoe UI", sans-serif;
   color: #162c28;
   background: #f7faf8;
@@ -8,7 +9,7 @@
 body {
   box-sizing: border-box;
   width: 344px;
-  max-width: 100vw;
+  background: inherit;
   margin: 0;
   font-size: 13px;
   line-height: 1.45;

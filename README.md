@@ -52,6 +52,8 @@ open ./build/Build/Products/Release/ShkolkovoSafari.app
 
 Скрипт по умолчанию подписывает приложение для запуска на своём Mac. Для подписи командой Apple выберите её в Xcode или передайте `SHKOLKOVO_TEAM_ID` при запуске скрипта. Для обновления пересоберите проект, запустите новую сборку и перезапустите Safari. [Запуск расширения в Xcode](https://developer.apple.com/documentation/safariservices/running-your-safari-web-extension) · [Права доступа в Safari](https://developer.apple.com/documentation/safariservices/managing-safari-web-extension-permissions)
 
+Если меню открывается пустым, проверьте, что в настройках Safari у расширения указана версия 1.8.1. Для диагностики откройте меню расширения, затем выберите **Разработка → этот Mac → Extension Popup Page** и посмотрите первую ошибку в консоли. Сообщение «Фоновый скрипт Safari не ответил» относится к отдельной консоли **Разработка → Web Extension Background Content**. [Диагностика Safari у Apple](https://developer.apple.com/documentation/safariservices/troubleshooting-your-safari-web-extension)
+
 ## Запустить мониторинг
 
 1. Войдите в Школково в том же профиле браузера и откройте страницу чатов.

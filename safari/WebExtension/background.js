@@ -38,7 +38,9 @@ let curatorFile;
 let writes = Promise.resolve();
 async function readCuratorFile() {
   try {
-    const response = await fetch(api.runtime.getURL('curator.json'), { cache: 'no-store' });
+    const response = await fetch(api.runtime.getURL('curator.json'), {
+      cache: 'no-store', signal: AbortSignal.timeout(4_000)
+    });
     return response.ok ? identity.parse(await response.json()) : null;
   } catch { return null; }
 }
@@ -795,7 +797,10 @@ api.runtime.onMessage.addListener((m, sender, respond) => {
   else if (Number.isSafeInteger(sender.tab?.id) && (sender.frameId ?? 0) === 0 && onChat(address) &&
            typeof m.documentToken === 'string' && /^[0-9a-f-]{36}$/iu.test(m.documentToken)) action = tabMessage(m, sender);
   if (!action) return false;
-  action.then(respond, () => respond({ ok: false, error: 'Safari не смогла выполнить действие. Проверь доступ расширения к сайтам.' }));
+  action.then(respond, error => {
+    console.warn('Школково. Ошибка фонового запроса.', m.type, error?.name, error?.message);
+    respond({ ok: false, error: 'Фоновый скрипт Safari не смог выполнить запрос.' });
+  });
   return true;
 });
 api.alarms.onAlarm.addListener(a => { if ([HOUR_ALARM, PREFETCH_ALARM, TASK_ALARM].includes(a.name)) kick(); });

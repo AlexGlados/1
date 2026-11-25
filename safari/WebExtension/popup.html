@@ -10,7 +10,7 @@
 <body>
   <main>
     <h1>Мониторинг чатов</h1>
-    <p id="status" class="status" role="status">Проверяю состояние…</p>
+    <p id="status" class="status" role="status">Подключаюсь к расширению…</p>
     <form id="curator-form" aria-label="Имя и фамилия куратора" hidden>
       <label for="curator-first-name">Имя</label>
       <input id="curator-first-name" name="firstName" type="text" autocomplete="given-name" required>
@@ -19,7 +19,7 @@
       <button id="save-curator" type="submit">Сохранить</button>
       <p id="curator-feedback" class="note" role="status" hidden></p>
     </form>
-    <div id="monitor-controls">
+    <div id="monitor-controls" hidden>
       <p id="connection" class="connection">Статус неизвестен</p>
       <dl>
         <div><dt>Состав на час</dt><dd id="period">—</dd></div>

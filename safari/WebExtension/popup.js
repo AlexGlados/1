@@ -2,7 +2,8 @@
 const el = id => document.getElementById(id);
 const extension = globalThis.browser ?? globalThis.chrome;
 const runtime = extension?.runtime;
-const hasExtension = Boolean(runtime?.id && typeof runtime.sendMessage === 'function');
+const hasExtension = typeof runtime?.sendMessage === 'function';
+const noResponse = 'Фоновый скрипт Safari не ответил.';
 const connectionLabels = {
   online: 'Платформа в сети', connecting: 'Платформа подключается',
   offline: 'Платформа не в сети', unknown: 'Статус неизвестен'
@@ -14,6 +15,7 @@ const moscowTime = new Intl.DateTimeFormat('ru-RU', {
 let state;
 let changing = false;
 let revision = 0;
+let refreshTimer;
 let lastFreeList;
 let dismissButtons = [];
 function message(id, text) {
@@ -80,20 +82,20 @@ function drawFreeList(free = []) {
     focused?.focus({ preventScroll: true });
   }
 }
-function draw(s) {
+function draw(s, error = '') {
   state = s;
   const currentWorker = s?.rulesVersion === 3;
   const curatorRequired = currentWorker && s.curatorRequired === true;
   const canStart = s?.canStart ?? s?.attached;
   const status = !hasExtension ? 'Открой это меню через кнопку расширения в Safari.'
-    : !s ? 'Не удалось получить состояние расширения.'
+    : !s ? error || noResponse
     : !currentWorker ? 'Действует прежняя версия расширения. Переоткрой его меню после обновления.'
     : curatorRequired ? 'Укажи имя и фамилию куратора, как в расписании.'
     : s.active ? (s.ready ? 'Проверка запущена в отдельной вкладке' : 'Ожидаю загрузку списка чатов')
     : canStart ? 'Проверка остановлена' : 'Открой страницу чатов. После установки обнови вкладку.';
   el('status').textContent = status;
   el('curator-form').hidden = !curatorRequired;
-  el('monitor-controls').hidden = curatorRequired;
+  el('monitor-controls').hidden = !currentWorker || curatorRequired;
   for (const id of ['curator-first-name', 'curator-last-name', 'save-curator']) el(id).disabled = changing || !curatorRequired;
   el('toggle').textContent = s?.active ? 'Остановить проверку' : 'Запустить мониторинг';
   el('toggle').disabled = changing || !currentWorker || curatorRequired || !(s?.active || canStart);
@@ -123,14 +125,25 @@ function draw(s) {
   message('note', [s?.error, schedule, s?.scanStatus, s?.reason].filter(Boolean).join(' '));
   if (s?.result && !el('feedback').textContent) message('feedback', s.result);
 }
+async function request(message, timeoutMs) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(noResponse)), timeoutMs);
+  });
+  try { return await Promise.race([runtime.sendMessage(message), timeout]); }
+  finally { clearTimeout(timer); }
+}
 async function refresh() {
   if (changing) return;
   const ticket = ++revision;
-  const s = await runtime.sendMessage({ type: 'ui:status' }).catch(() => null);
-  if (ticket === revision && !changing) draw(s?.ok === false ? null : s);
+  const s = await request({ type: 'ui:status' }, 8_000).catch(() => null);
+  if (ticket !== revision || changing) return;
+  draw(s?.ok === false ? null : s, s?.error);
+  refreshTimer = setTimeout(refresh, 2_000);
 }
 async function command(type, fields = {}) {
   if (changing) return;
+  clearTimeout(refreshTimer);
   changing = true;
   revision++;
   const settingCurator = type === 'ui:set-curator';
@@ -138,7 +151,7 @@ async function command(type, fields = {}) {
   draw(type === 'ui:settings' ? { ...state, ...fields } : state);
   message(feedback, '');
   try {
-    const r = await runtime.sendMessage({ type, ...fields });
+    const r = await request({ type, ...fields }, type === 'ui:test' ? 60_000 : 20_000);
     const success = type === 'ui:test' ? 'Тестовое уведомление отправлено.'
       : type === 'ui:dismiss-free' ? 'Чат убран из списка.' : '';
     message(feedback, r?.ok ? r.message || success
@@ -168,7 +181,5 @@ el('senior').addEventListener('change', event => command('ui:settings', {
 el('pinned-instant').addEventListener('change', event => command('ui:settings', {
   pinnedInstant: event.currentTarget.checked
 }));
-if (hasExtension) {
-  void refresh();
-  setInterval(refresh, 2000);
-} else draw(null);
+if (hasExtension) void refresh();
+else draw(null);

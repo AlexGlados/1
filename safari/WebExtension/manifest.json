@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Школково — свободные чаты",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "Уведомления о свободных и закреплённых чатах с учётом действующего дежурства по Москве.",
   "browser_specific_settings": { "safari": { "strict_min_version": "17.4" } },
   "permissions": ["nativeMessaging", "storage", "alarms"],
