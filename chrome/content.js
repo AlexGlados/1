@@ -79,13 +79,22 @@
         .some(el => el.getClientRects().length));
   }
 
-  function isProtected() {
-    return userPresent() || hasDraft() || !validPage();
+  function protectionReason() {
+    if (userPresent()) return 'in_use';
+    if (hasDraft()) return 'draft';
+    return validPage() ? '' : 'page';
+  }
+
+  function inspectionBlock() {
+    if (!contextActive()) return 'page';
+    const protectedBy = protectionReason();
+    if (protectedBy) return protectedBy;
+    if (!navigator.onLine || ['connecting', 'offline'].includes(connection.details().connection)) return 'connection';
+    return '';
   }
 
   function canInspect() {
-    return contextActive() && !isProtected() && navigator.onLine &&
-      !['connecting', 'offline'].includes(connection.details().connection);
+    return !inspectionBlock();
   }
 
   function scan() {
@@ -371,7 +380,7 @@
   function statusSnapshot() {
     connection.refresh();
     return { ...rowsSnapshot(), connection: connection.details().connection || 'unknown',
-      protected: isProtected() || Boolean(activeRead || navigation) };
+      protected: Boolean(protectionReason() || activeRead || navigation) };
   }
 
   function lookup(id) {
@@ -534,7 +543,10 @@
   async function read(request) {
     const { id, job = {} } = request;
     const rowKey = job.rowKey || id;
-    const fail = (reason, blocked = false) => ({ id, ready: false, reason, blocked, complete: false, messages: [] });
+    const fail = (reason, blocked = false) => {
+      const tabBlock = blocked ? inspectionBlock() : '';
+      return { id, ready: false, reason, blocked, complete: false, messages: [], ...(tabBlock ? { tabBlock } : {}) };
+    };
     const expiresAt = Math.min(request.expiresAt ?? Date.now() + 25_000,
       Number.isFinite(job.at) ? job.at + dom.recentWindow : Infinity);
     const allowed = () => session === request.session && canInspect() && Date.now() < expiresAt;
@@ -629,7 +641,7 @@
   }
 
   function canReload() {
-    if (!session || !contextActive() || activeRead || navigation || isProtected() || !navigator.onLine) return false;
+    if (!session || !contextActive() || activeRead || navigation || protectionReason() || !navigator.onLine) return false;
     connection.refresh();
     return !['connecting', 'offline'].includes(connection.details().connection);
   }

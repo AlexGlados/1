@@ -7,6 +7,16 @@ const connectionLabels = {
   online: 'Платформа в сети', connecting: 'Платформа подключается',
   offline: 'Платформа не в сети', unknown: 'Статус неизвестен'
 };
+const tabBlockLabels = {
+  in_use: 'Переключись на другую вкладку. Проверка продолжится в фоне.',
+  draft: 'Во вкладке проверки есть черновик или вложение. Очередь продолжится после его обработки.',
+  connection: 'Очередь продолжится после восстановления связи со Школково.',
+  loading: 'Жду загрузки вкладки проверки.',
+  frozen: 'Chrome заморозил вкладку проверки. Открой её, затем вернись в рабочую вкладку.',
+  discarded: 'Chrome выгрузил вкладку проверки. Открой её, затем вернись в рабочую вкладку.',
+  page: 'Верни вкладку проверки на страницу чатов Школково.',
+  missing: 'Жду доступную вкладку проверки.'
+};
 const clock = globalThis.ShkolkovoTime;
 const HOUR = 3_600_000;
 let tabId;
@@ -82,7 +92,7 @@ function draw(s) {
   state = s;
   const local = clock.local();
   message('time-zone', 'Часовой пояс · ' + local.zoneLabel(Date.now()));
-  const currentWorker = s?.rulesVersion === 4;
+  const currentWorker = s?.rulesVersion === 5;
   const curatorRequired = currentWorker && s.curatorRequired === true;
   const canStart = s?.canStart ?? s?.attached;
   const status = !hasExtension ? 'Открой это меню через кнопку расширения в Chrome.'
@@ -122,7 +132,7 @@ function draw(s) {
   } else if (range && s.prefetchError) {
     schedule = s.prefetchError + '. Нужен состав на ' + clock.scheduleRange(s.scheduleHour + HOUR).moscow + '.';
   } else if (range && s.loading) schedule = 'Загружаю состав на ' + range.moscow + '.';
-  message('note', [s?.error, schedule, s?.scanStatus, s?.reason].filter(Boolean).join(' '));
+  message('note', [s?.error, s?.active && tabBlockLabels[s.tabBlock], schedule, s?.scanStatus, s?.reason].filter(Boolean).join(' '));
   if (s?.result && !el('feedback').textContent) message('feedback', s.result);
 }
 async function refresh() {

@@ -6,6 +6,8 @@ const identity = globalThis.ShkolkovoIdentity;
 const shiftLog = globalThis.ShkolkovoShiftLog;
 const clock = globalThis.ShkolkovoTime;
 const MIN = 60_000;
+const TAB_RETRY = 10_000;
+const TAB_BLOCKS = new Set(['in_use', 'draft', 'connection', 'loading', 'frozen', 'discarded', 'page', 'missing']);
 const KEY = 'shkolkovo.monitor.v2';
 const BOOT = 'shkolkovo.browserSession';
 const HOUR_ALARM = 'shkolkovo.period';
@@ -26,6 +28,7 @@ const blankConnection = () => ({ status: 'unknown', episode: '', since: 0, alert
 function blank() {
   return { scan: E.fresh(), tab: null, lastWatchTab: null, boot: null, ownedTab: true, doc: null, ready: false, capturedHandoff: null,
     coverage: null, connection: blankConnection(), syncAt: 0, curatorSyncAt: null,
+    tabBlock: null, lastRecoveryAt: null,
     outbox: {}, routes: {}, checked: 0, notified: 0, error: '', result: '' };
 }
 
@@ -49,6 +52,7 @@ function useCurator(s, name) {
   s.curatorSyncAt = Date.now();
   s.doc = null;
   s.ready = false;
+  s.tabBlock = null;
   s.connection = blankConnection();
   for (const notice of Object.values(s.outbox)) notice.session = token(s);
 }
@@ -65,7 +69,7 @@ function tx(fn) {
       if (db.boot !== bootId || db.ownedTab !== true) {
         // Older versions could use the operator's tab. Tab IDs also expire when Chrome restarts.
         Object.assign(db, { tab: null, lastWatchTab: null, doc: null, ready: false, coverage: null,
-          connection: blankConnection(), boot: bootId, ownedTab: true, routes: {} });
+          connection: blankConnection(), boot: bootId, ownedTab: true, routes: {}, tabBlock: null, lastRecoveryAt: null });
       }
     }
     try {
@@ -97,8 +101,21 @@ function pause(s, reason) {
   if (Number.isInteger(s.tab)) s.lastWatchTab = s.tab;
   E.stop(s.scan);
   Object.assign(s, { tab: null, doc: null, ready: false, syncAt: 0, curatorSyncAt: null,
-    connection: blankConnection(), error: '' });
+    connection: blankConnection(), error: '', tabBlock: null });
 }
+function loseMonitorTab(s, reason) {
+  const now = Date.now();
+  if (reason === 'window_closed' || (Number.isFinite(s.lastRecoveryAt) && now - s.lastRecoveryAt < MIN)) {
+    pause(s, reason === 'window_closed' ? reason : 'tab_closed_again');
+    s.result = 'Вкладка проверки закрылась. Запусти мониторинг, чтобы продолжить.';
+  } else {
+    shiftLog.record(s, now, 'monitor_tab_recovering', { reason });
+    Object.assign(s, { tab: null, doc: null, ready: false, coverage: null, tabBlock: null,
+      connection: blankConnection(), lastRecoveryAt: now, syncAt: now + 2.5 * MIN, curatorSyncAt: now + 15_000 });
+  }
+  s.lastWatchTab = null;
+}
+
 async function monitorTab(s) {
   if (Number.isSafeInteger(s.tab)) return s.tab;
   let tab;
@@ -111,9 +128,13 @@ async function monitorTab(s) {
     }
   }
   if (!tab) tab = await chrome.tabs.create({ url: chatUrl, active: false });
+  if (tab.autoDiscardable !== false) await chrome.tabs.update(tab.id, { autoDiscardable: false }).catch(() => {});
   Object.assign(s, { tab: tab.id, lastWatchTab: tab.id, boot: bootId, doc: null, ready: false,
-    coverage: null, connection: blankConnection() });
+    coverage: null, connection: blankConnection(), tabBlock: null });
   for (const notice of Object.values(s.outbox)) notice.tab = tab.id;
+  for (const route of Object.values(s.routes)) {
+    if (route.boot === bootId) route.tab = tab.id;
+  }
   return tab.id;
 }
 async function openShiftChat(id) {
@@ -162,11 +183,15 @@ async function syncCurator(ref) {
     if (monitoring(s) && s.tab === ref.tab && token(s) === ref.session) s.curatorSyncAt = null;
   });
 }
-async function backgroundTab(id) {
-  const tab = await chrome.tabs.get(id);
-  if (tab.discarded || tab.frozen || tab.status === 'loading' || (tab.url && !onChat(tab.url)) ||
-      (tab.pendingUrl && !onChat(tab.pendingUrl))) return false;
-  return !tab.active || (await chrome.windows.get(tab.windowId)).focused === false;
+async function tabBlockReason(id) {
+  const tab = await chrome.tabs.get(id).catch(() => null);
+  if (!tab) return 'missing';
+  if (tab.discarded) return 'discarded';
+  if (tab.frozen) return 'frozen';
+  if (tab.status === 'loading') return 'loading';
+  if ((tab.url && !onChat(tab.url)) || (tab.pendingUrl && !onChat(tab.pendingUrl))) return 'page';
+  if (tab.active && (await chrome.windows.get(tab.windowId).catch(() => null))?.focused !== false) return 'in_use';
+  return '';
 }
 function notification(title, message) {
   return { type: 'basic', iconUrl: 'icon.png', title, message };
@@ -389,7 +414,8 @@ async function plan() {
         actions.push(() => probe(probeRef));
       } else times.push(due);
     }
-    if (s.ready && s.doc && !runningSync && !runningRead && !handoffCapture) {
+    if (s.tabBlock?.retryAt > now) times.push(s.tabBlock.retryAt);
+    else if (s.ready && s.doc && !runningSync && !runningRead && !handoffCapture) {
       const job = E.next(s.scan, now);
       if (job) {
         runningRead = ref;
@@ -463,7 +489,8 @@ async function readSchedule(generation, period) {
 async function readChat(ref, job) {
   let history;
   try {
-    if (!await backgroundTab(ref.tab)) history = { blocked: true };
+    const tabBlock = await tabBlockReason(ref.tab);
+    if (tabBlock) history = { blocked: true, tabBlock };
     else {
       const valid = await tx(s => {
         if (!current(s, ref) || (!job.pinned && job.period !== s.scan.period)) return false;
@@ -483,9 +510,22 @@ async function readChat(ref, job) {
       if (history) await tx(s => {
         if (!current(s, ref)) return;
         if (history.blocked) {
-          E.defer(s.scan, job, Date.now(), 10_000);
-          shiftLog.record(s, Date.now(), 'chat_check_deferred');
+          const now = Date.now();
+          if (TAB_BLOCKS.has(history.tabBlock)) {
+            if (s.tabBlock?.reason !== history.tabBlock) {
+              shiftLog.record(s, now, 'chat_check_deferred', { reason: history.tabBlock });
+            }
+            s.tabBlock = { reason: history.tabBlock, retryAt: now + TAB_RETRY };
+          } else {
+            s.tabBlock = null;
+            E.defer(s.scan, job, now, TAB_RETRY);
+            shiftLog.record(s, now, 'chat_check_deferred', { reason: 'job_changed' });
+          }
           return;
+        }
+        if (s.tabBlock) {
+          shiftLog.record(s, Date.now(), 'chat_checks_resumed', { previousReason: s.tabBlock.reason });
+          s.tabBlock = null;
         }
         const c = s.scan.chats[job.id];
         const previousCheck = c?.checked;
@@ -501,7 +541,7 @@ async function readChat(ref, job) {
 async function sync(ref) {
   let result;
   try {
-    if (await backgroundTab(ref.tab) && await tx(s => current(s, ref))) {
+    if (!await tabBlockReason(ref.tab) && await tx(s => current(s, ref))) {
       result = await send(ref.tab, { type: 'monitor:reload', session: ref.session, expiresAt: Date.now() + 5000 }, ref.doc);
     }
   } catch { /* The document may already be reloading. */ }
@@ -611,6 +651,7 @@ async function tabMessage(m, sender) {
         s.doc = sender.documentId;
         s.ready = false;
         s.connection = blankConnection();
+        s.tabBlock = null;
       }
       return { session: token(s), generation: s.scan.generation, curatorName: s.scan.curatorName };
     }
@@ -646,11 +687,14 @@ async function tabMessage(m, sender) {
       }
       case 'monitor:connection':
         connection(s, m.status);
+        if (m.status === 'online' && s.tabBlock?.reason === 'connection') s.tabBlock.retryAt = 0;
         break;
       case 'monitor:connection-alert':
         if (s.connection.status === m.status) connection(s, m.status, true);
         break;
-      case 'monitor:wake': break;
+      case 'monitor:wake':
+        if (s.tabBlock?.reason === 'in_use') s.tabBlock.retryAt = 0;
+        break;
       case 'monitor:panel-change':
         E.panelChanged(s.scan, m, Date.now());
         break;
@@ -702,7 +746,7 @@ async function details(tabId) {
     const free = chats.filter(c => E.isFree(c, now)).map(c => ({
       id: c.id, title: c.title, version: E.freeVersion(c), ...waiting(c, now)
     })).sort((a, b) => (a.waitingSince ?? Infinity) - (b.waitingSince ?? Infinity) || a.title.localeCompare(b.title, 'ru'));
-    return { ...summary(s), canStart: Boolean(s.scan.curatorName), supportsFreeDismissal: true, rulesVersion: 4,
+    return { ...summary(s), canStart: Boolean(s.scan.curatorName), supportsFreeDismissal: true, rulesVersion: 5,
       attached: Number.isSafeInteger(s.lastWatchTab),
       here: monitoring(s) && tabId === s.tab, ready: monitoring(s) && s.ready, pinnedInstant: s.scan.pinnedImmediate !== false,
       scanComplete: s.coverage?.complete ?? null, scanStatus: coverageLabel(s), free,
@@ -710,7 +754,7 @@ async function details(tabId) {
       checked: s.checked || 0, notified: s.notified || 0,
       pending: recent.filter(c => c.pending).length, uncertain: uncertain.length,
       reason: failedChat ? `Не удалось проверить «${failedChat.title}». ${failedChat.reason}` : '',
-      connection: s.connection.status,
+      connection: s.connection.status, tabBlock: s.tabBlock?.retryAt > now ? s.tabBlock.reason : '',
       error: s.error };
   });
   kick();
@@ -833,7 +877,7 @@ async function popupMessage(m) {
         E.start(s.scan, now);
         shiftLog.start(s, now);
         for (const notice of Object.values(s.outbox)) notice.session = token(s);
-        Object.assign(s, { syncAt: Date.now() + 2.5 * MIN, result: '', error: '' });
+        Object.assign(s, { syncAt: Date.now() + 2.5 * MIN, result: '', error: '', lastRecoveryAt: null });
       }
       s.curatorSyncAt = Date.now() + 15_000;
       return { ok: true, tab, session: token(s), generation: s.scan.generation, curatorName: s.scan.curatorName };
@@ -902,16 +946,23 @@ chrome.downloads.onChanged.addListener(change => {
     return true;
   }).then(ready => { if (ready) kick(); }, failed);
 });
-chrome.tabs.onRemoved.addListener(id => {
+chrome.tabs.onRemoved.addListener((id, info) => {
   void tx(s => {
-    if (s.tab === id) pause(s, 'tab_closed');
-    if (s.lastWatchTab === id) s.lastWatchTab = null;
+    if (s.tab === id) loseMonitorTab(s, info?.isWindowClosing ? 'window_closed' : 'tab_closed');
+    else if (s.lastWatchTab === id) s.lastWatchTab = null;
   }).then(kick, failed);
 });
 chrome.tabs.onUpdated.addListener((id, change) => {
-  if (change.status === 'loading') void tx(s => {
-    if (s.tab === id) { s.ready = false; s.doc = null; s.connection = blankConnection(); }
-  }).then(kick, failed);
+  if (change.status !== 'loading' && change.frozen !== false && change.discarded !== false) return;
+  void tx(s => {
+    if (s.tab !== id) return false;
+    if (change.status === 'loading') {
+      Object.assign(s, { ready: false, doc: null, connection: blankConnection(), tabBlock: null });
+    } else if (s.tabBlock && ['discarded', 'frozen'].includes(s.tabBlock.reason)) {
+      s.tabBlock.retryAt = 0;
+    }
+    return true;
+  }).then(changed => { if (changed) kick(); }, failed);
 });
 chrome.notifications.onClosed.addListener(id => { void tx(s => { delete s.routes[id]; }).catch(failed); });
 chrome.notifications.onClicked.addListener(id => {
