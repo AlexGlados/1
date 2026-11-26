@@ -8,8 +8,8 @@
   const WAIT_MAX_AGE = 12 * HOUR;
   const minute = at => Math.floor(at / MIN) * MIN;
   // Moscow is UTC+3, an integral number of hours. Epoch-hour boundaries coincide.
-  const periodAt = now => Math.floor((now + 5 * MIN) / HOUR) * HOUR;
-  const nextHour = now => Math.floor(now / HOUR) * HOUR + HOUR;
+  const calendarPeriodAt = now => Math.floor(now / HOUR) * HOUR;
+  const periodAt = now => calendarPeriodAt(now + 5 * MIN);
   const boundary = (now, s) => (s?.period ?? periodAt(now)) + 55 * MIN;
   const prefetchTime = (now, s) => boundary(now, s) - MIN;
   const freshlyPrepared = (s, period) => s.prepared?.period === period && s.prepared.readAt >= period - 6 * MIN;
@@ -29,9 +29,9 @@
 
   function fresh() {
     return { enabled: false, generation: 0, baseline: false, rowsObservedAt: null, period: null,
-      roster: null, directory: [], appliedPeriod: null, prepared: null,
+      roster: null, directory: [], appliedPeriod: null, prepared: null, calendarRoster: null,
       prefetchError: '', prefetchRetryAt: 0, scheduleError: '', scheduleRetryAt: 0, scheduleReadAt: null,
-      mode: 'normal', pinnedImmediate: true, curatorName: '', startedAt: null, startTarget: null,
+      mode: 'normal', pinnedImmediate: true, curatorName: '', startedAt: null,
       coveragePending: false, handover: null, chats: {}, dismissedFree: {}, inactiveRows: {}, offDutyReviewQueued: true };
   }
 
@@ -40,14 +40,17 @@
     s.enabled = true;
     s.startedAt = now;
     s.coveragePending = false;
-    s.startTarget = nextHour(now);
-    s.prepared = null;
     s.prefetchError = '';
     s.prefetchRetryAt = 0;
     advance(s, now);
-    if (s.period === s.startTarget) s.roster = null;
     s.scheduleError = '';
     s.scheduleRetryAt = now;
+    if (s.period === calendarPeriodAt(now)) {
+      s.roster = null;
+      s.scheduleReadAt = null;
+    } else {
+      s.calendarRoster = null;
+    }
   }
   function stop(s) {
     s.enabled = false;
@@ -90,6 +93,14 @@
   }
   function advance(s, now) {
     if (!s.enabled) return false;
+    const calendar = calendarPeriodAt(now);
+    if (!Object.hasOwn(s, 'calendarRoster')) {
+      s.calendarRoster = null;
+      delete s.startTarget;
+      // Older builds used the same date for the active roster and its prefetch.
+      if (s.scheduleReadAt === s.prepared?.readAt) s.scheduleReadAt = null;
+    }
+    if (s.calendarRoster && s.calendarRoster.period !== calendar) s.calendarRoster = null;
     for (const [id, removed] of Object.entries(s.dismissedFree ?? {})) {
       if (removed.at <= now - RECENT_MAX_AGE) delete s.dismissedFree[id];
     }
@@ -153,9 +164,14 @@
     }
     const previous = s.period;
     if (s.appliedPeriod == null && s.roster) s.appliedPeriod = previous;
+    if (previous === calendar) {
+      // The previous roster is still the calendar-hour schedule until :00.
+      s.calendarRoster = { period: previous, names: s.roster, readAt: s.scheduleReadAt,
+        error: s.scheduleError, retryAt: s.scheduleRetryAt };
+    }
     s.period = periodAt(now);
-    if (s.startTarget < s.period) s.startTarget = null;
     s.roster = null;
+    s.scheduleReadAt = null;
     s.scheduleError = previous != null ? s.prefetchError || 'Не удалось обновить расписание: ожидается состав на новый час.' : '';
     s.scheduleRetryAt = now;
     s.prefetchRetryAt = 0;
@@ -170,11 +186,20 @@
     if (prepared?.period === s.period) activateRoster(s, prepared, now);
     return true;
   }
+  function calendarSchedule(s, now) {
+    const period = calendarPeriodAt(now);
+    if (s.period === period) {
+      return { period, loaded: Boolean(s.roster?.length), readAt: s.scheduleReadAt ?? null,
+        error: s.scheduleError || '', retryAt: s.scheduleRetryAt || 0 };
+    }
+    const cached = s.calendarRoster?.period === period ? s.calendarRoster : null;
+    return { period, loaded: Boolean(cached?.names?.length), readAt: cached?.readAt ?? null,
+      error: cached?.error || '', retryAt: cached?.retryAt || 0 };
+  }
   function scheduleTarget(s, now, skip = new Set()) {
     if (!s.enabled) return null;
-    const explicit = s.startTarget;
-    if (explicit != null && !skip.has(explicit) && (explicit === s.period
-      ? s.scheduleRetryAt <= now : s.prefetchRetryAt <= now)) return explicit;
+    const calendar = calendarSchedule(s, now);
+    if (!calendar.loaded && calendar.retryAt <= now && !skip.has(calendar.period)) return calendar.period;
     if (!s.roster && s.scheduleRetryAt <= now && !skip.has(s.period)) return s.period;
     const next = s.period + HOUR;
     if (now >= prefetchTime(now, s) && !freshlyPrepared(s, next) &&
@@ -235,20 +260,23 @@
   }
   function installRoster(s, ticket, names, error, now, directory = []) {
     advance(s, now);
-    const ahead = ticket.period === s.period + HOUR && (ticket.period === s.startTarget || now >= prefetchTime(now, s));
-    if (!s.enabled || ticket.generation !== s.generation || (ticket.period !== s.period && !ahead)) return false;
+    const effective = ticket.period === s.period;
+    const calendarOnly = !effective && ticket.period === calendarPeriodAt(now);
+    const ahead = ticket.period === s.period + HOUR && now >= prefetchTime(now, s);
+    if (!s.enabled || ticket.generation !== s.generation || !(effective || calendarOnly || ahead)) return false;
     if (error || !Array.isArray(names) || !names.length || names.some(n => typeof n !== 'string' || !words(n).length)) {
       const why = 'Не удалось обновить расписание: ' + (error || 'на нужный час не удалось прочитать состав.');
       if (ahead && !freshlyPrepared(s, ticket.period)) {
         s.prefetchError = why;
         s.prefetchRetryAt = Math.min(boundary(now, s), now + MIN);
-      } else if (!ahead && !s.roster) {
+      } else if (calendarOnly && !calendarSchedule(s, now).loaded) {
+        s.calendarRoster = { period: ticket.period, names: null, readAt: null, error: why, retryAt: now + 5 * MIN };
+      } else if (effective && !s.roster) {
         s.scheduleError = why;
         s.scheduleRetryAt = now + 5 * MIN;
       }
       return true;
     }
-    if (ticket.period === s.startTarget) s.startTarget = null;
     const roster = [...new Map(names.map(n => [normal(n), n.trim()])).values()];
     const data = { period: ticket.period, names: roster, readAt: now,
       directory: [...new Map([...roster, ...directory].map(n => [normal(n), n])).values()] };
@@ -256,7 +284,8 @@
       s.prepared = data;
       s.prefetchError = '';
       s.prefetchRetryAt = 0;
-      s.scheduleReadAt = now;
+    } else if (calendarOnly) {
+      s.calendarRoster = { period: ticket.period, names: roster, readAt: now, error: '', retryAt: 0 };
     } else {
       activateRoster(s, data, now);
     }
@@ -1020,7 +1049,8 @@
     return true;
   }
 
-  const api = { fresh, start, stop, finish, advance, periodAt, boundary, prefetchTime, scheduleTarget, installRoster,
+  const api = { fresh, start, stop, finish, advance, periodAt, calendarPeriodAt, calendarSchedule,
+    boundary, prefetchTime, scheduleTarget, installRoster,
     observe, reconcileRows, panelChanged, earliest, next, defer, apply, navigation,
     setMode, setPinnedInstant, dueNotices, nextNoticeAt, noticeEligible, setChatMute, unbind, isFree, freeVersion, dismissFree,
     waitingSince, isRecentChat: inWindow };

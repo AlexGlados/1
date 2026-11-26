@@ -169,6 +169,12 @@
 			path = "schedule-config.json";
 			sourceTree = "<group>";
 		};
+		000000000000000000000045 = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.javascript;
+			path = time.js;
+			sourceTree = "<group>";
+		};
 		000000000000000000000018 = {
 			isa = PBXGroup;
 			children = (
@@ -190,6 +196,7 @@
 				00000000000000000000003F,
 				000000000000000000000040,
 				000000000000000000000043,
+				000000000000000000000045,
 			);
 			path = WebExtension;
 			sourceTree = "<group>";
@@ -308,6 +315,10 @@
 			isa = PBXBuildFile;
 			fileRef = 000000000000000000000043;
 		};
+		000000000000000000000046 = {
+			isa = PBXBuildFile;
+			fileRef = 000000000000000000000045;
+		};
 		00000000000000000000002E = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -330,6 +341,7 @@
 				000000000000000000000041,
 				000000000000000000000042,
 				000000000000000000000044,
+				000000000000000000000046,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -358,10 +370,10 @@
 			buildSettings = {
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				DEVELOPMENT_LANGUAGE = ru;
 				MACOSX_DEPLOYMENT_TARGET = 14.4;
-				MARKETING_VERSION = 1.9.2;
+				MARKETING_VERSION = 1.10.0;
 				SDKROOT = macosx;
 				SUPPORTED_PLATFORMS = macosx;
 				SWIFT_VERSION = 5.0;
@@ -375,10 +387,10 @@
 			buildSettings = {
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				DEVELOPMENT_LANGUAGE = ru;
 				MACOSX_DEPLOYMENT_TARGET = 14.4;
-				MARKETING_VERSION = 1.9.2;
+				MARKETING_VERSION = 1.10.0;
 				SDKROOT = macosx;
 				SUPPORTED_PLATFORMS = macosx;
 				SWIFT_VERSION = 5.0;

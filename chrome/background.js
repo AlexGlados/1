@@ -1,5 +1,5 @@
 'use strict';
-importScripts('identity.js', 'engine.js', 'schedule.js');
+importScripts('identity.js', 'engine.js', 'schedule.js', 'time.js');
 
 const E = globalThis.ChatEngine;
 const identity = globalThis.ShkolkovoIdentity;
@@ -13,11 +13,7 @@ const chatUrl = 'https://1.shkolkovo.online/chat';
 const chatOrigin = new URL(chatUrl).origin;
 const popupUrl = chrome.runtime.getURL('popup.html');
 const shiftUrl = chrome.runtime.getURL('shift.html');
-const stamp = new Intl.DateTimeFormat('ru-RU', {
-  timeZone: 'Europe/Moscow', day: '2-digit', month: '2-digit', year: 'numeric',
-  hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
-});
-const timeLabel = value => stamp.format(value).replace(',', '') + ' МСК';
+const timeLabel = value => globalThis.ShkolkovoTime.local().label(value);
 const token = state => String(state.scan.generation);
 const monitoring = state => state.scan.enabled && Boolean(state.scan.curatorName);
 const curatorRequiredMessage = 'Введи имя и фамилию куратора в меню расширения.';
@@ -268,7 +264,8 @@ async function plan() {
     const boundary = E.boundary(now, s.scan);
     const preload = E.prefetchTime(now, s.scan);
     const nextPreload = preload > now ? preload : preload + 60 * MIN;
-    const times = [now + MIN, boundary, nextPreload];
+    const calendar = E.calendarSchedule(s.scan, now);
+    const times = [now + MIN, boundary, nextPreload, calendar.period + 60 * MIN];
     if (Number.isFinite(s.curatorSyncAt)) {
       if (s.curatorSyncAt <= now) {
         const update = { ...ref, generation: s.scan.generation, curatorName: s.scan.curatorName };
@@ -295,7 +292,7 @@ async function plan() {
       inFlight.add(target);
       actions.push(() => readSchedule(generation, target));
     }
-    for (const retry of [s.scan.scheduleRetryAt, s.scan.prefetchRetryAt]) if (retry > now) times.push(retry);
+    for (const retry of [calendar.retryAt, s.scan.scheduleRetryAt, s.scan.prefetchRetryAt]) if (retry > now) times.push(retry);
     for (const item of E.dueNotices(s.scan, now)) addNotice(s, item);
     const noticeAt = E.nextNoticeAt(s.scan, now);
     if (noticeAt > now) times.push(noticeAt);
@@ -579,12 +576,18 @@ async function tabMessage(m, sender) {
 
 function summary(s) {
   const active = monitoring(s);
+  const now = Date.now();
+  const calendar = E.calendarSchedule(s.scan, now);
+  const incoming = s.scan.period > calendar.period;
+  const prefetchError = incoming ? s.scan.scheduleError : s.scan.prefetchError;
+  const retryAt = calendar.error || !calendar.loaded ? calendar.retryAt
+    : incoming ? s.scan.scheduleRetryAt : s.scan.prefetchRetryAt;
   return { active, curatorRequired: !s.scan.curatorName, mode: s.scan.mode || 'normal',
-    period: active ? timeLabel(s.scan.period) : '', lastRead: s.scan.scheduleReadAt ? timeLabel(s.scan.scheduleReadAt) : '',
-    scheduleError: s.scan.scheduleError || '', prefetchError: s.scan.prefetchError || '',
-    nextPeriod: active ? timeLabel(s.scan.period + 60 * MIN) : '',
-    retryAt: s.scan.scheduleRetryAt > Date.now() ? timeLabel(s.scan.scheduleRetryAt) : '',
-    loading: active && !Array.isArray(s.scan.roster), result: s.result };
+    period: active ? timeLabel(calendar.period) : '', lastRead: calendar.readAt ? timeLabel(calendar.readAt) : '',
+    scheduleError: calendar.error || '', prefetchError: prefetchError || '',
+    nextPeriod: active ? timeLabel(calendar.period + 60 * MIN) : '',
+    retryAt: retryAt > now ? timeLabel(retryAt) : '',
+    loading: active && !calendar.loaded, result: s.result };
 }
 function coverageLabel(s) {
   if (!monitoring(s) || !s.coverage) return '';

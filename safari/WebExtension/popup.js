@@ -8,10 +8,7 @@ const connectionLabels = {
   online: 'Платформа в сети', connecting: 'Платформа подключается',
   offline: 'Платформа не в сети', unknown: 'Статус неизвестен'
 };
-const moscowTime = new Intl.DateTimeFormat('ru-RU', {
-  timeZone: 'Europe/Moscow', day: '2-digit', month: '2-digit', year: 'numeric',
-  hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
-});
+const clock = globalThis.ShkolkovoTime;
 let state;
 let changing = false;
 let revision = 0;
@@ -22,7 +19,7 @@ function message(id, text) {
   el(id).textContent = text;
   el(id).hidden = !text;
 }
-function drawFreeList(free = []) {
+function drawFreeList(local, free = []) {
   const rows = free.map(chat => {
     const identity = { id: chat.id, title: chat.title, version: chat.version };
     if (!Number.isFinite(chat.waitingSince)) {
@@ -30,8 +27,7 @@ function drawFreeList(free = []) {
     }
     const minutes = Math.max(0, Math.floor((chat.waitMs ?? Date.now() - chat.waitingSince) / 60_000));
     const wait = (minutes >= 60 ? Math.floor(minutes / 60) + ' ч ' : '') + minutes % 60 + ' мин';
-    return { ...identity, at: chat.waitingSince,
-      label: moscowTime.format(chat.waitingSince).replace(',', '') + ' МСК', wait };
+    return { ...identity, at: chat.waitingSince, label: local.label(chat.waitingSince), wait };
   });
   const signature = JSON.stringify(rows);
   if (signature === lastFreeList) {
@@ -84,6 +80,8 @@ function drawFreeList(free = []) {
 }
 function draw(s, error = '') {
   state = s;
+  const local = clock.local();
+  message('time-zone', 'Часовой пояс · ' + local.zoneLabel(Date.now()));
   const currentWorker = s?.rulesVersion === 4;
   const curatorRequired = currentWorker && s.curatorRequired === true;
   const canStart = s?.canStart ?? s?.attached;
@@ -113,7 +111,7 @@ function draw(s, error = '') {
   el('period').textContent = s?.period || '—';
   el('last-read').textContent = s?.lastRead || '—';
   for (const id of ['bindings', 'uncertain', 'pending', 'checked', 'notified']) el(id).textContent = s?.[id] ?? '—';
-  drawFreeList(s?.free);
+  drawFreeList(local, s?.free);
   let schedule = '';
   if (s?.active && s.scheduleError) {
     const reason = s.scheduleError.includes('Не удалось обновить расписание') ? s.scheduleError :

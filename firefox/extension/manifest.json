@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Школково — свободные чаты",
-  "version": "1.9.1",
+  "version": "1.10.0",
   "description": "Уведомления о свободных и закреплённых чатах с учётом действующего дежурства по Москве.",
   "browser_specific_settings": {
     "gecko": {
@@ -12,7 +12,7 @@
   },
   "permissions": ["notifications", "storage", "alarms"],
   "host_permissions": ["https://1.shkolkovo.online/*", "https://docs.google.com/*"],
-  "background": { "scripts": ["identity.js", "engine.js", "schedule.js", "background.js"] },
+  "background": { "scripts": ["identity.js", "engine.js", "schedule.js", "time.js", "background.js"] },
   "icons": { "128": "icon.png" },
   "action": {
     "default_title": "Свободные чаты Школково",

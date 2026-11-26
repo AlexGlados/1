@@ -3,16 +3,10 @@
   const storageKey = 'shkolkovo.monitor.v2';
   const minute = 60_000;
   const hour = 60 * minute;
-  const dates = new Intl.DateTimeFormat('ru-RU', {
-    timeZone: 'Europe/Moscow', day: '2-digit', month: '2-digit', year: 'numeric'
-  });
-  const times = new Intl.DateTimeFormat('ru-RU', {
-    timeZone: 'Europe/Moscow', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
-  });
+  const clock = globalThis.ShkolkovoTime ?? (typeof module !== 'undefined' ? require('./time.js') : null);
   const collator = new Intl.Collator('ru', { sensitivity: 'base', numeric: true });
   const nameKey = name => name.toLocaleLowerCase('ru').replaceAll('ё', 'е').trim().split(/\s+/).sort().join(' ');
-  const stamp = (value, now) => dates.format(value) === dates.format(now)
-    ? times.format(value) : dates.format(value) + ' · ' + times.format(value);
+  const stamp = (value, now) => clock.local().stamp(value, now);
   // Moscow's whole-hour offset aligns its :00 boundaries with UTC epoch hours.
   const hourStart = now => Math.floor(now / hour) * hour;
   const activeInHour = (row, start) => Number.isFinite(row.activityAt) && row.activityAt >= start && row.activityAt < start + hour;
@@ -81,11 +75,11 @@
     buttons.set(buttonKey(id, action), button);
     return button;
   }
-  function timeCell(value, label, now) {
+  function timeCell(value, label, now, local) {
     const td = node('td');
     td.dataset.label = label;
     if (Number.isFinite(value)) {
-      const time = node('time', stamp(value, now));
+      const time = node('time', local.stamp(value, now));
       time.dateTime = new Date(value).toISOString();
       td.append(time);
     } else td.textContent = '—';
@@ -95,7 +89,7 @@
     if (!Number.isFinite(minutes)) return '—';
     return (minutes >= 60 ? Math.floor(minutes / 60) + ' ч ' : '') + minutes % 60 + ' мин';
   }
-  function renderGroup(group, now, canManage) {
+  function renderGroup(group, now, canManage, local) {
     const section = node('section');
     const heading = node('h2', group.title);
     heading.append(node('span', String(group.rows.length), 'count'));
@@ -113,7 +107,7 @@
     for (const row of group.rows) {
       const line = body.insertRow();
       line.insertCell().append(actionButton(row.id, 'open', row.title, '', 'chat', row.available === false));
-      line.append(timeCell(row.lastStudentAt, labels[1], now), timeCell(row.lastCuratorAt, labels[2], now));
+      line.append(timeCell(row.lastStudentAt, labels[1], now, local), timeCell(row.lastCuratorAt, labels[2], now, local));
       const waiting = line.insertCell();
       waiting.dataset.label = labels[3];
       waiting.className = 'duration';
@@ -144,8 +138,16 @@
     lastSnapshot = status;
     clearTimeout(timer);
     const now = Date.now();
+    const local = clock.local();
+    const zoneLabel = local.zoneLabel(now);
     const { groups, refreshAt, start } = shiftGroups(status.occupied || [], now);
-    timer = setTimeout(() => draw(lastSnapshot), Math.max(1, refreshAt - now));
+    const activityHour = local.range(start, start + hour);
+    const nextLocalCheck = Math.floor(now / minute) * minute + minute;
+    timer = setTimeout(() => {
+      const current = clock.local();
+      if (current.zone !== local.zone) void refresh();
+      draw(lastSnapshot);
+    }, Math.max(1, Math.min(refreshAt, nextLocalCheck) - now));
     const { active, mode, period, result, scheduleError, prefetchError, loading, retryAt, nextPeriod, curatorRequired } = status;
     let scheduleStatus = active && (scheduleError || prefetchError) || '';
     if (scheduleStatus) {
@@ -156,7 +158,8 @@
       if (schedulePeriod) scheduleStatus += ' · Состав на ' + schedulePeriod;
       if (retryAt) scheduleStatus += ' · Повтор в ' + retryAt;
     }
-    const signature = JSON.stringify([groups, start, active, mode, period, result, scheduleStatus, loading, curatorRequired]);
+    const signature = JSON.stringify([groups, start, local.zone, zoneLabel, local.date(now), activityHour,
+      active, mode, period, result, scheduleStatus, loading, curatorRequired]);
     if (signature === previous) return;
     previous = signature;
 
@@ -166,7 +169,8 @@
     const monitorLabel = canManage ? 'Режим старшего включён'
       : active ? 'Обычный режим' : mode === 'senior' ? 'Режим старшего выбран · мониторинг остановлен' : 'Мониторинг остановлен';
     if (monitor.textContent !== monitorLabel) monitor.textContent = monitorLabel;
-    el('activity-hour').textContent = 'Текущий час ' + times.format(start) + '–' + times.format(start + hour) + ' МСК';
+    el('time-zone').textContent = 'Часовой пояс · ' + zoneLabel;
+    el('activity-hour').textContent = 'Час мониторинга ' + activityHour;
     el('occupied-count').textContent = 'Чатов за час — ' + groups.reduce((total, group) => total + group.rows.length, 0);
     el('period').textContent = period ? (loading ? 'Ожидается состав на ' : 'Состав на ') + period : '';
     el('schedule-status').textContent = scheduleStatus;
@@ -179,7 +183,7 @@
     if (!active && groups.length === 0) feed.hidden = true;
     const focused = document.activeElement?.dataset;
     buttons.clear();
-    el('groups').replaceChildren(...groups.map(group => renderGroup(group, now, canManage)));
+    el('groups').replaceChildren(...groups.map(group => renderGroup(group, now, canManage, local)));
     if (focused?.chat) buttons.get(buttonKey(focused.chat, focused.action))?.focus({ preventScroll: true });
   }
 
