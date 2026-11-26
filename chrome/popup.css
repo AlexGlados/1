@@ -127,6 +127,11 @@ dd {
   font-variant-numeric: tabular-nums;
 }
 
+#period-local {
+  display: block;
+  font-weight: 400;
+}
+
 button {
   display: block;
   width: 100%;

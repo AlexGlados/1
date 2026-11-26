@@ -8,6 +8,7 @@ const connectionLabels = {
   offline: 'Платформа не в сети', unknown: 'Статус неизвестен'
 };
 const clock = globalThis.ShkolkovoTime;
+const HOUR = 3_600_000;
 let tabId;
 let state;
 let changing = false;
@@ -81,7 +82,7 @@ function draw(s) {
   state = s;
   const local = clock.local();
   message('time-zone', 'Часовой пояс · ' + local.zoneLabel(Date.now()));
-  const currentWorker = s?.rulesVersion === 3;
+  const currentWorker = s?.rulesVersion === 4;
   const curatorRequired = currentWorker && s.curatorRequired === true;
   const canStart = s?.canStart ?? s?.attached;
   const status = !hasExtension ? 'Открой это меню через кнопку расширения в Chrome.'
@@ -107,18 +108,20 @@ function draw(s) {
   const conn = s?.active ? s.connection : 'unknown';
   el('connection').dataset.state = conn;
   el('connection').textContent = connectionLabels[conn] || connectionLabels.unknown;
-  el('period').textContent = s?.period || '—';
+  const range = Number.isFinite(s?.scheduleHour) ? clock.scheduleRange(s.scheduleHour) : null;
+  el('period').textContent = range?.moscow || '—';
+  message('period-local', range?.local || '');
   el('last-read').textContent = s?.lastRead || '—';
   for (const id of ['bindings', 'uncertain', 'pending', 'checked', 'notified']) el(id).textContent = s?.[id] ?? '—';
   drawFreeList(local, s?.free);
   let schedule = '';
-  if (s?.active && s.scheduleError) {
+  if (range && s.scheduleError) {
     const reason = s.scheduleError.includes('Не удалось обновить расписание') ? s.scheduleError :
       'Не удалось обновить расписание. ' + s.scheduleError;
-    schedule = reason + '. Нужен состав на ' + s.period + '. ' + (s.retryAt ? 'Повтор в ' + s.retryAt + '.' : 'Загружаю состав.');
-  } else if (s?.active && s.prefetchError) {
-    schedule = s.prefetchError + '. Нужен состав на ' + s.nextPeriod + '.';
-  } else if (s?.loading) schedule = 'Загружаю состав на ' + s.period + '.';
+    schedule = reason + '. Нужен состав на ' + range.moscow + '. ' + (s.retryAt ? 'Повтор в ' + s.retryAt + '.' : 'Загружаю состав.');
+  } else if (range && s.prefetchError) {
+    schedule = s.prefetchError + '. Нужен состав на ' + clock.scheduleRange(s.scheduleHour + HOUR).moscow + '.';
+  } else if (range && s.loading) schedule = 'Загружаю состав на ' + range.moscow + '.';
   message('note', [s?.error, schedule, s?.scanStatus, s?.reason].filter(Boolean).join(' '));
   if (s?.result && !el('feedback').textContent) message('feedback', s.result);
 }

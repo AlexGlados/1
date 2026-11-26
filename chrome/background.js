@@ -4,6 +4,7 @@ importScripts('identity.js', 'engine.js', 'schedule.js', 'time.js', 'shift-log.j
 const E = globalThis.ChatEngine;
 const identity = globalThis.ShkolkovoIdentity;
 const shiftLog = globalThis.ShkolkovoShiftLog;
+const clock = globalThis.ShkolkovoTime;
 const MIN = 60_000;
 const KEY = 'shkolkovo.monitor.v2';
 const BOOT = 'shkolkovo.browserSession';
@@ -16,7 +17,7 @@ const chatOrigin = new URL(chatUrl).origin;
 const popupUrl = chrome.runtime.getURL('popup.html');
 const shiftUrl = chrome.runtime.getURL('shift.html');
 const logSettingsUrl = chrome.runtime.getURL('log-settings.html');
-const timeLabel = value => globalThis.ShkolkovoTime.local().label(value);
+const timeLabel = value => clock.local().label(value);
 const token = state => String(state.scan.generation);
 const monitoring = state => state.scan.enabled && Boolean(state.scan.curatorName);
 const curatorRequiredMessage = 'Введи имя и фамилию куратора в меню расширения.';
@@ -438,17 +439,18 @@ function pendingHandoffRows(tab, doc, session) {
 }
 
 async function readSchedule(generation, period) {
-  const iso = new Date(period + 3 * 60 * MIN).toISOString();
+  const moscow = clock.moscowHour(period);
   let result;
   let error;
-  try { result = await ShSchedule.read(iso.slice(0, 10), Number(iso.slice(11, 13))); }
+  try { result = await ShSchedule.read(moscow.date, moscow.hour); }
   catch (e) { error = e.message || 'Не удалось прочитать таблицу.'; }
   try {
     await tx(s => {
       const now = Date.now();
       if (monitoring(s) && E.installRoster(s.scan, { generation, period }, result?.names, error, now, result?.directory)) {
         shiftLog.record(s, now, result ? 'schedule_loaded' : 'schedule_failed', {
-          hourMsk: iso.slice(0, 19) + '+03:00', ...(result && { rosterSize: result.names.length })
+          hourMsk: `${moscow.date}T${moscow.time}:00${moscow.offset}`,
+          ...(result && { rosterSize: result.names.length })
         });
         if (result?.names.length === 0) shiftLog.observe(s, now, true, { period, names: result.names });
       }
@@ -670,6 +672,7 @@ function summary(s) {
   const retryAt = calendar.error || !calendar.loaded ? calendar.retryAt
     : incoming ? s.scan.scheduleRetryAt : s.scan.prefetchRetryAt;
   return { active, curatorRequired: !s.scan.curatorName, mode: s.scan.mode || 'normal',
+    scheduleHour: active ? calendar.period : null,
     period: active ? timeLabel(calendar.period) : '', lastRead: calendar.readAt ? timeLabel(calendar.readAt) : '',
     scheduleError: calendar.error || '', prefetchError: prefetchError || '',
     nextPeriod: active ? timeLabel(calendar.period + 60 * MIN) : '',
@@ -699,7 +702,7 @@ async function details(tabId) {
     const free = chats.filter(c => E.isFree(c, now)).map(c => ({
       id: c.id, title: c.title, version: E.freeVersion(c), ...waiting(c, now)
     })).sort((a, b) => (a.waitingSince ?? Infinity) - (b.waitingSince ?? Infinity) || a.title.localeCompare(b.title, 'ru'));
-    return { ...summary(s), canStart: Boolean(s.scan.curatorName), supportsFreeDismissal: true, rulesVersion: 3,
+    return { ...summary(s), canStart: Boolean(s.scan.curatorName), supportsFreeDismissal: true, rulesVersion: 4,
       attached: Number.isSafeInteger(s.lastWatchTab),
       here: monitoring(s) && tabId === s.tab, ready: monitoring(s) && s.ready, pinnedInstant: s.scan.pinnedImmediate !== false,
       scanComplete: s.coverage?.complete ?? null, scanStatus: coverageLabel(s), free,
