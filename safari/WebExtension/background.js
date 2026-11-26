@@ -11,8 +11,7 @@ const BOOT = 'shkolkovo.browserSession';
 const HOUR_ALARM = 'shkolkovo.period';
 const PREFETCH_ALARM = 'shkolkovo.prefetch';
 const TASK_ALARM = 'shkolkovo.tasks';
-const chatUrl = 'https://1.shkolkovo.online/chat';
-const chatOrigin = new URL(chatUrl).origin;
+const chatOrigin = 'https://1.shkolkovo.online';
 const popupUrl = api.runtime.getURL('popup.html');
 const shiftUrl = api.runtime.getURL('shift.html');
 const stamp = new Intl.DateTimeFormat('ru-RU', {
@@ -21,12 +20,14 @@ const stamp = new Intl.DateTimeFormat('ru-RU', {
 });
 const timeLabel = value => stamp.format(value).replace(',', '') + ' МСК';
 const token = state => String(state.scan.generation);
-const monitoring = state => state.scan.enabled && Boolean(state.scan.curatorName);
+const monitoring = state => state.tabSelection === 'manual' && Number.isSafeInteger(state.tab) &&
+  state.scan.enabled && Boolean(state.scan.curatorName);
 const curatorRequiredMessage = 'Введи имя и фамилию куратора в меню расширения.';
+const selectChatTabMessage = 'Открой вкладку чатов Школково и запусти мониторинг из её меню расширения.';
 const commandTimeout = { 'monitor:read': 28_000, 'monitor:open': 17_000 };
 const blankConnection = () => ({ status: 'unknown', episode: '', since: 0, alerted: false, onlineSeen: false });
 function blank() {
-  return { scan: E.fresh(), tab: null, lastWatchTab: null, boot: null, ownedTab: true, doc: null, ready: false, capturedHandoff: null,
+  return { scan: E.fresh(), tab: null, lastWatchTab: null, boot: null, tabSelection: 'manual', doc: null, ready: false, capturedHandoff: null,
     coverage: null, connection: blankConnection(), syncAt: 0, curatorSyncAt: null,
     outbox: {}, routes: {}, checked: 0, notified: 0, error: '', result: '' };
 }
@@ -67,13 +68,15 @@ function tx(fn) {
       if (!session[BOOT]) await api.storage.session.set({ [BOOT]: bootId });
       db = local[KEY] || blank();
       snapshot = JSON.stringify(db);
-      if (db.boot !== bootId || db.ownedTab !== true) {
-        // Older versions could use the operator's tab. Tab IDs also expire when Safari restarts.
-        Object.assign(db, { tab: null, lastWatchTab: null, doc: null, ready: false, coverage: null,
-          connection: blankConnection(), boot: bootId, ownedTab: true, routes: {} });
-      }
     }
     try {
+      if (db.boot !== bootId || db.tabSelection !== 'manual') {
+        // A browser restart or a legacy automatic session requires a fresh user selection.
+        if (db.scan.enabled) pause(db);
+        Object.assign(db, { tab: null, lastWatchTab: null, doc: null, ready: false, coverage: null,
+          connection: blankConnection(), boot: bootId, tabSelection: 'manual', routes: {} });
+        delete db.ownedTab;
+      }
       const fileName = await curatorFile;
       if (fileName) useCurator(db, fileName);
       if (monitoring(db)) E.advance(db.scan, Date.now());
@@ -98,23 +101,6 @@ function pause(s) {
   E.stop(s.scan);
   Object.assign(s, { tab: null, doc: null, ready: false, syncAt: 0, curatorSyncAt: null,
     connection: blankConnection(), error: '' });
-}
-async function monitorTab(s) {
-  if (Number.isSafeInteger(s.tab)) return s.tab;
-  let tab;
-  if (s.boot === bootId && Number.isSafeInteger(s.lastWatchTab)) {
-    tab = await api.tabs.get(s.lastWatchTab).catch(() => null);
-    if (tab) {
-      const address = tab.pendingUrl || tab.url;
-      const onMonitorPage = address ? onChat(address) : (await send(tab.id, { type: 'monitor:ping' }).catch(() => null))?.ok;
-      if (!onMonitorPage) tab = null;
-    }
-  }
-  if (!tab) tab = await api.tabs.create({ url: chatUrl, active: false });
-  Object.assign(s, { tab: tab.id, lastWatchTab: tab.id, boot: bootId, doc: null, ready: false,
-    coverage: null, connection: blankConnection() });
-  for (const notice of Object.values(s.outbox)) notice.tab = tab.id;
-  return tab.id;
 }
 async function openShiftChat(id) {
   const dest = await tx(s => {
@@ -278,7 +264,6 @@ async function plan() {
       await Promise.all([HOUR_ALARM, PREFETCH_ALARM, TASK_ALARM].map(name => alarm(name, Infinity)));
       return [];
     }
-    if (!Number.isSafeInteger(s.tab)) await monitorTab(s);
     const now = Date.now();
     const ref = { tab: s.tab, session: token(s), doc: s.doc };
     if (runningRead && !current(s, runningRead)) runningRead = null;
@@ -648,7 +633,7 @@ async function details(tabId) {
     const free = chats.filter(c => E.isFree(c, now)).map(c => ({
       id: c.id, title: c.title, version: E.freeVersion(c), ...waiting(c, now)
     })).sort((a, b) => (a.waitingSince ?? Infinity) - (b.waitingSince ?? Infinity) || a.title.localeCompare(b.title, 'ru'));
-    return { ...summary(s), canStart: Boolean(s.scan.curatorName), supportsFreeDismissal: true, rulesVersion: 3,
+    return { ...summary(s), canStart: Boolean(s.scan.curatorName), supportsFreeDismissal: true, rulesVersion: 4,
       attached: Number.isSafeInteger(s.lastWatchTab),
       here: monitoring(s) && tabId === s.tab, ready: monitoring(s) && s.ready, pinnedInstant: s.scan.pinnedImmediate !== false,
       scanComplete: s.coverage?.complete ?? null, scanStatus: coverageLabel(s), free,
@@ -775,20 +760,32 @@ async function popupMessage(m) {
     return { ok: true };
   }
   if (m.type === 'ui:start') {
+    if (!Number.isSafeInteger(m.tabId)) return { ok: false, error: selectChatTabMessage };
+    const page = await send(m.tabId, { type: 'monitor:ping' }).catch(() => null);
     const answer = await tx(async s => {
       if (!s.scan.curatorName) return { ok: false, error: curatorRequiredMessage };
-      const tab = await monitorTab(s);
-      if (!s.scan.enabled) {
+      const selected = await api.tabs.get(m.tabId).catch(() => null);
+      const address = selected?.pendingUrl || selected?.url;
+      if (!selected?.active || (address && !onChat(address))) return { ok: false, error: selectChatTabMessage };
+      if (!page?.ok) return { ok: false, error: 'Открой чаты Школково. Если они уже открыты, обнови страницу и повтори запуск.' };
+      const tab = m.tabId;
+      if (monitoring(s) && s.tab !== tab) {
+        return { ok: false, error: 'Останови проверку перед запуском мониторинга в другой вкладке.' };
+      }
+      if (!monitoring(s)) {
         E.start(s.scan, Date.now());
-        for (const notice of Object.values(s.outbox)) notice.session = token(s);
-        Object.assign(s, { syncAt: Date.now() + 2.5 * MIN, result: '', error: '' });
+        Object.assign(s, { tab, lastWatchTab: tab, doc: null, ready: false, coverage: null,
+          connection: blankConnection(), syncAt: Date.now() + 2.5 * MIN, result: '', error: '' });
+        for (const notice of Object.values(s.outbox)) {
+          notice.tab = tab;
+          notice.session = token(s);
+        }
       }
       s.curatorSyncAt = Date.now() + 15_000;
       return { ok: true, tab, session: token(s), generation: s.scan.generation, curatorName: s.scan.curatorName };
     });
     if (!answer.ok) return answer;
     kick();
-    // A newly created content document will also request the session with monitor:hello.
     await syncCurator(answer);
     return answer;
   }
@@ -835,9 +832,17 @@ api.tabs.onRemoved.addListener(id => {
     if (s.lastWatchTab === id) s.lastWatchTab = null;
   }).then(kick, failed);
 });
-api.tabs.onUpdated.addListener((id, change) => {
-  if (change.status === 'loading') void tx(s => {
-    if (s.tab === id) { s.ready = false; s.doc = null; s.connection = blankConnection(); }
+api.tabs.onUpdated.addListener((id, change, tab) => {
+  if (change.url || change.status === 'loading' || change.status === 'complete') void tx(s => {
+    const address = change.url || tab?.pendingUrl || tab?.url;
+    if (address && !onChat(address)) {
+      if (s.tab === id) pause(s);
+      if (s.lastWatchTab === id) s.lastWatchTab = null;
+    } else if (s.tab === id && change.status === 'loading') {
+      s.ready = false;
+      s.doc = null;
+      s.connection = blankConnection();
+    }
   }).then(kick, failed);
 });
 notifications.onClosed?.addListener?.(id => { void tx(s => { delete s.routes[id]; }).catch(failed); });

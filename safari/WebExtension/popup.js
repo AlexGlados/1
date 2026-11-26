@@ -84,15 +84,15 @@ function drawFreeList(free = []) {
 }
 function draw(s, error = '') {
   state = s;
-  const currentWorker = s?.rulesVersion === 3;
+  const currentWorker = s?.rulesVersion === 4;
   const curatorRequired = currentWorker && s.curatorRequired === true;
   const canStart = s?.canStart ?? s?.attached;
   const status = !hasExtension ? 'Открой это меню через кнопку расширения в Safari.'
     : !s ? error || noResponse
     : !currentWorker ? 'Действует прежняя версия расширения. Переоткрой его меню после обновления.'
     : curatorRequired ? 'Укажи имя и фамилию куратора, как в расписании.'
-    : s.active ? (s.ready ? 'Проверка запущена в отдельной вкладке' : 'Ожидаю загрузку списка чатов')
-    : canStart ? 'Проверка остановлена' : 'Открой страницу чатов. После установки обнови вкладку.';
+    : s.active ? (s.ready ? 'Проверка запущена в выбранной вкладке' : 'Ожидаю загрузку списка чатов')
+    : 'Открой чаты Школково и запусти проверку из этой вкладки.';
   el('status').textContent = status;
   el('curator-form').hidden = !curatorRequired;
   el('monitor-controls').hidden = !currentWorker || curatorRequired;
@@ -151,7 +151,16 @@ async function command(type, fields = {}) {
   draw(type === 'ui:settings' ? { ...state, ...fields } : state);
   message(feedback, '');
   try {
-    const r = await request({ type, ...fields }, type === 'ui:test' ? 60_000 : 20_000);
+    const action = { type, ...fields };
+    if (type === 'ui:start') {
+      const [tab] = await extension.tabs.query({ active: true, currentWindow: true });
+      if (!Number.isSafeInteger(tab?.id)) {
+        message(feedback, 'Открой вкладку чатов Школково и запусти мониторинг из неё.');
+        return;
+      }
+      action.tabId = tab.id;
+    }
+    const r = await request(action, type === 'ui:test' ? 60_000 : 20_000);
     const success = type === 'ui:test' ? 'Тестовое уведомление отправлено.'
       : type === 'ui:dismiss-free' ? 'Чат убран из списка.' : '';
     message(feedback, r?.ok ? r.message || success

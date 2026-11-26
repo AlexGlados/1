@@ -18,7 +18,7 @@ private struct ExtensionSetupView: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Школково для Safari")
                 .font(.title.bold())
-            Text("Включи расширение в Safari и открой чаты Школково. При первом запуске введи имя и фамилию куратора в меню расширения, затем запусти мониторинг.")
+            Text("Включи расширение в Safari, открой чаты Школково и открой меню расширения в этой вкладке. При первом запуске введи имя и фамилию куратора. Затем нажми «Запустить мониторинг».")
                 .fixedSize(horizontal: false, vertical: true)
             Button("Открыть настройки расширения") {
                 guard let identifier = Bundle.main.bundleIdentifier else { return }
