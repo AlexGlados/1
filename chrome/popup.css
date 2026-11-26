@@ -13,6 +13,12 @@ body {
   line-height: 1.45;
 }
 
+.log-settings {
+  width: auto;
+  max-width: 520px;
+  margin: 24px auto;
+}
+
 main {
   padding: 18px;
 }

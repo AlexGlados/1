@@ -100,7 +100,6 @@
       assignments.set(key, header[i]);
       filled++;
     }
-    if (!filled) throw new Error('На нужный час нет заполненных назначений');
     if (!/^\d+$/.test(row[3]) || Number(row[3]) !== filled) throw new Error('Число назначений расходится с итогом в строке');
     for (const name of [row[2], row[4]]) {
       if (name && !assignments.has(nameKey(name))) throw new Error('Назначение в столбце роли расходится с персональными столбцами');

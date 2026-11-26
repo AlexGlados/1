@@ -1,18 +1,21 @@
 'use strict';
-importScripts('identity.js', 'engine.js', 'schedule.js', 'time.js');
+importScripts('identity.js', 'engine.js', 'schedule.js', 'time.js', 'shift-log.js', 'log-folder.js');
 
 const E = globalThis.ChatEngine;
 const identity = globalThis.ShkolkovoIdentity;
+const shiftLog = globalThis.ShkolkovoShiftLog;
 const MIN = 60_000;
 const KEY = 'shkolkovo.monitor.v2';
 const BOOT = 'shkolkovo.browserSession';
 const HOUR_ALARM = 'shkolkovo.period';
 const PREFETCH_ALARM = 'shkolkovo.prefetch';
 const TASK_ALARM = 'shkolkovo.tasks';
+const LOG_ALARM = 'shkolkovo.log-export';
 const chatUrl = 'https://1.shkolkovo.online/chat';
 const chatOrigin = new URL(chatUrl).origin;
 const popupUrl = chrome.runtime.getURL('popup.html');
 const shiftUrl = chrome.runtime.getURL('shift.html');
+const logSettingsUrl = chrome.runtime.getURL('log-settings.html');
 const timeLabel = value => globalThis.ShkolkovoTime.local().label(value);
 const token = state => String(state.scan.generation);
 const monitoring = state => state.scan.enabled && Boolean(state.scan.curatorName);
@@ -38,6 +41,7 @@ async function readCuratorFile() {
 }
 function useCurator(s, name) {
   if (s.scan.curatorName === name) return;
+  if (!identity.matches(s.scan.curatorName, name)) shiftLog.finish(s, Date.now(), 'curator_changed');
   s.scan.curatorName = name;
   if (!s.scan.enabled) return;
   s.scan.generation++;
@@ -66,8 +70,12 @@ function tx(fn) {
     try {
       const fileName = await curatorFile;
       if (fileName) useCurator(db, fileName);
-      if (monitoring(db)) E.advance(db.scan, Date.now());
+      const now = Date.now();
+      if (monitoring(db) && !db.shiftLogs) shiftLog.start(db, now);
+      shiftLog.observe(db, now, monitoring(db));
+      if (monitoring(db)) E.advance(db.scan, now);
       const value = await fn(db);
+      shiftLog.observe(db, Date.now(), monitoring(db));
       const next = JSON.stringify(db);
       if (snapshot !== next) {
         await chrome.storage.local.set({ [KEY]: db });
@@ -83,7 +91,8 @@ function tx(fn) {
   return action;
 }
 
-function pause(s) {
+function pause(s, reason) {
+  if (s.scan.enabled) shiftLog.record(s, Date.now(), 'monitor_paused', { reason });
   if (Number.isInteger(s.tab)) s.lastWatchTab = s.tab;
   E.stop(s.scan);
   Object.assign(s, { tab: null, doc: null, ready: false, syncAt: 0, curatorSyncAt: null,
@@ -184,6 +193,7 @@ function connection(s, status, verified = false) {
   const previous = c.status;
   c.onlineSeen ??= previous === 'online' && s.ready;
   c.status = status;
+  if (previous !== status) shiftLog.record(s, Date.now(), 'connection_changed', { status });
   if (status === 'online' && s.ready) c.onlineSeen = true;
   if (status === 'unknown') return;
   const now = Date.now();
@@ -206,6 +216,7 @@ let runningProbe;
 let handoffCapture;
 let captureRetryAt = 0;
 let runningDelivery;
+let runningLogExport = false;
 const fetching = new Map(); // target roster hour -> shift generation
 let retryWake = 0;
 function kick() {
@@ -242,15 +253,71 @@ function addRows(s, result) {
   E.observe(s.scan, result.rows, Date.now(), result.observedAt, { partial: result.partial === true });
 }
 
+async function planLogExport(s, now, actions) {
+  const report = s.shiftLogs?.pending[0];
+  let wake = shiftLog.nextBoundary(s, now);
+  const ready = report && !runningLogExport && report.retryAt <= now;
+  if (report) wake = Math.min(wake, report.retryAt > now ? report.retryAt : now + MIN);
+  await alarm(LOG_ALARM, wake);
+  if (ready) actions.push(() => exportShiftLog(report));
+}
+
+async function exportShiftLog(report) {
+  if (runningLogExport) return;
+  runningLogExport = true;
+  try {
+    const filename = shiftLog.filename(report);
+    let where;
+    let downloadId = report.downloadId;
+    const retryAt = Date.now() + MIN;
+    if (downloadId == null) {
+      const text = shiftLog.render(report, chrome.runtime.getManifest().version);
+      const written = await globalThis.ShkolkovoLogFolder.write(filename, text).catch(() => false);
+      if (written) where = 'folder';
+      else {
+        downloadId = await chrome.downloads.download({
+          url: 'data:text/plain;charset=utf-8,' + encodeURIComponent(text),
+          filename: 'logs/' + filename, conflictAction: 'overwrite', saveAs: false
+        }).catch(() => null);
+      }
+    }
+    if (downloadId != null) {
+      const downloads = await chrome.downloads.search({ id: downloadId }).catch(() => null);
+      if (downloads) {
+        const [download] = downloads;
+        if (download?.state === 'complete') where = 'downloads';
+        else if (!download || download.state === 'interrupted') downloadId = null;
+      }
+    }
+    await tx(s => {
+      const logs = s.shiftLogs;
+      const pending = logs?.pending[0];
+      if (pending?.id !== report.id) return;
+      if (where) {
+        logs.pending.shift();
+        logs.lastExport = { where, filename };
+      } else {
+        pending.downloadId = downloadId;
+        pending.retryAt = retryAt;
+      }
+    });
+  } finally {
+    runningLogExport = false;
+    kick();
+  }
+}
+
 async function plan() {
   const tasks = await tx(async s => {
     clearTimeout(timer);
+    const now = Date.now();
+    const actions = [];
     if (!monitoring(s)) {
       await Promise.all([HOUR_ALARM, PREFETCH_ALARM, TASK_ALARM].map(name => alarm(name, Infinity)));
-      return [];
+      await planLogExport(s, now, actions);
+      return actions;
     }
     if (!Number.isSafeInteger(s.tab)) await monitorTab(s);
-    const now = Date.now();
     const ref = { tab: s.tab, session: token(s), doc: s.doc };
     if (runningRead && !current(s, runningRead)) runningRead = null;
     if (runningProbe && !current(s, runningProbe)) runningProbe = null;
@@ -260,7 +327,6 @@ async function plan() {
       captureRetryAt = 0;
     }
     if (runningSync && (runningSync.session !== ref.session || runningSync.tab !== ref.tab)) runningSync = null;
-    const actions = [];
     const boundary = E.boundary(now, s.scan);
     const preload = E.prefetchTime(now, s.scan);
     const nextPreload = preload > now ? preload : preload + 60 * MIN;
@@ -335,6 +401,7 @@ async function plan() {
     const at = Math.min(...times);
     await alarm(TASK_ALARM, at);
     timer = setTimeout(kick, Math.max(25, at - Date.now()));
+    await planLogExport(s, now, actions);
     return actions;
   });
   for (const run of tasks) void run().catch(failed);
@@ -377,7 +444,15 @@ async function readSchedule(generation, period) {
   try { result = await ShSchedule.read(iso.slice(0, 10), Number(iso.slice(11, 13))); }
   catch (e) { error = e.message || 'Не удалось прочитать таблицу.'; }
   try {
-    await tx(s => monitoring(s) && E.installRoster(s.scan, { generation, period }, result?.names, error, Date.now(), result?.directory));
+    await tx(s => {
+      const now = Date.now();
+      if (monitoring(s) && E.installRoster(s.scan, { generation, period }, result?.names, error, now, result?.directory)) {
+        shiftLog.record(s, now, result ? 'schedule_loaded' : 'schedule_failed', {
+          hourMsk: iso.slice(0, 19) + '+03:00', ...(result && { rosterSize: result.names.length })
+        });
+        if (result?.names.length === 0) shiftLog.observe(s, now, true, { period, names: result.names });
+      }
+    });
   } finally {
     if (fetching.get(period) === generation) fetching.delete(period);
     kick();
@@ -405,11 +480,18 @@ async function readChat(ref, job) {
     try {
       if (history) await tx(s => {
         if (!current(s, ref)) return;
-        if (history.blocked) { E.defer(s.scan, job, Date.now(), 10_000); return; }
+        if (history.blocked) {
+          E.defer(s.scan, job, Date.now(), 10_000);
+          shiftLog.record(s, Date.now(), 'chat_check_deferred');
+          return;
+        }
         const c = s.scan.chats[job.id];
         const previousCheck = c?.checked;
         for (const n of E.apply(s.scan, job, history, Date.now())) addNotice(s, { ...n, period: job.period });
-        if (c?.checked && c.checked !== previousCheck) s.checked = (s.checked || 0) + 1;
+        if (c?.checked && c.checked !== previousCheck) {
+          s.checked = (s.checked || 0) + 1;
+          shiftLog.record(s, Date.now(), 'chat_checked', { status: c.status, pinned: job.pinned === true });
+        } else if (history.ready === false) shiftLog.record(s, Date.now(), 'chat_check_failed');
       });
     } finally { if (runningRead === ref) runningRead = null; kick(); }
   }
@@ -507,10 +589,12 @@ async function deliver(id) {
         }
         s.routes[id] = { tab: n.tab, id: n.id || null, kind: n.kind, boot: bootId };
         if (n.kind !== 'offline' && n.kind !== 'connecting') s.notified = (s.notified || 0) + 1;
+        shiftLog.record(s, now, 'notification_delivered', { kind: n.kind, phase: n.phase });
         removeNotice(s, id);
       } catch {
         n.retryAt = Date.now() + MIN;
         s.error = 'Chrome не показал уведомление. Следующая попытка через минуту.';
+        shiftLog.record(s, Date.now(), 'notification_retry', { kind: n.kind, phase: n.phase });
       }
     });
   } finally { runningDelivery = null; kick(); }
@@ -545,6 +629,9 @@ async function tabMessage(m, sender) {
           complete: m.complete, partial: m.partial === true, scanned: count(m.scanned), total: count(m.total), reason,
           retryAt: Number.isFinite(m.retryAt) ? m.retryAt : null
         };
+        shiftLog.record(s, Date.now(), 'chat_list_reviewed', {
+          complete: s.coverage.complete, partial: s.coverage.partial, scanned: s.coverage.scanned, total: s.coverage.total
+        });
         if (m.complete) {
           if (!s.coverage.partial && Array.isArray(m.keys) && m.keys.every(key => typeof key === 'string' && key.length > 0)) {
             E.reconcileRows(s.scan, m.keys);
@@ -739,7 +826,9 @@ async function popupMessage(m) {
       if (!s.scan.curatorName) return { ok: false, error: curatorRequiredMessage };
       const tab = await monitorTab(s);
       if (!s.scan.enabled) {
-        E.start(s.scan, Date.now());
+        const now = Date.now();
+        E.start(s.scan, now);
+        shiftLog.start(s, now);
         for (const notice of Object.values(s.outbox)) notice.session = token(s);
         Object.assign(s, { syncAt: Date.now() + 2.5 * MIN, result: '', error: '' });
       }
@@ -759,10 +848,11 @@ async function popupMessage(m) {
       const notices = m.type === 'ui:finish' ? [...Object.keys(s.routes), ...Object.keys(s.outbox)] : [];
       if (m.type === 'ui:finish') {
         const count = E.finish(s.scan);
+        shiftLog.finish(s, Date.now(), 'manual', { clearedBindings: count });
         const scan = s.scan;
         const lastWatchTab = s.lastWatchTab;
         Object.assign(s, blank(), { scan, boot: bootId, lastWatchTab, result: 'Смена завершена. Удалено привязок — ' + count });
-      } else pause(s);
+      } else pause(s, 'manual');
       return { old, notices, message: s.result, generation: s.scan.generation, curatorName };
     });
     await plan();
@@ -773,21 +863,45 @@ async function popupMessage(m) {
   }
   return { ok: false };
 }
+async function logSettingsMessage(m) {
+  if (m.type === 'monitor:log-export') {
+    await tx(s => {
+      const report = s.shiftLogs?.pending[0];
+      if (report) report.retryAt = 0;
+    });
+    kick();
+    return { ok: true };
+  }
+  if (m.type === 'monitor:log-status') {
+    return tx(s => ({ pending: s.shiftLogs?.pending.length ?? 0, lastExport: s.shiftLogs?.lastExport }));
+  }
+  return { ok: false };
+}
 chrome.runtime.onMessage.addListener((m, sender, respond) => {
   if (!m || sender.id !== chrome.runtime.id) return false;
   let action;
   if (sender.url === popupUrl) action = popupMessage(m);
   else if (sender.url === shiftUrl) action = shiftMessage(m);
+  else if (sender.url === logSettingsUrl) action = logSettingsMessage(m);
   else if (sender.tab && sender.frameId === 0 && onChat(sender.url) &&
            (!sender.documentLifecycle || sender.documentLifecycle === 'active')) action = tabMessage(m, sender);
   if (!action) return false;
   action.then(respond, () => respond({ ok: false, error: 'Chrome не смог выполнить действие. Проверь доступ и уведомления расширения.' }));
   return true;
 });
-chrome.alarms.onAlarm.addListener(a => { if ([HOUR_ALARM, PREFETCH_ALARM, TASK_ALARM].includes(a.name)) kick(); });
+chrome.alarms.onAlarm.addListener(a => { if ([HOUR_ALARM, PREFETCH_ALARM, TASK_ALARM, LOG_ALARM].includes(a.name)) kick(); });
+chrome.downloads.onChanged.addListener(change => {
+  if (!['complete', 'interrupted'].includes(change.state?.current)) return;
+  void tx(s => {
+    const report = s.shiftLogs?.pending[0];
+    if (report?.downloadId !== change.id) return false;
+    report.retryAt = 0;
+    return true;
+  }).then(ready => { if (ready) kick(); }, failed);
+});
 chrome.tabs.onRemoved.addListener(id => {
   void tx(s => {
-    if (s.tab === id) pause(s);
+    if (s.tab === id) pause(s, 'tab_closed');
     if (s.lastWatchTab === id) s.lastWatchTab = null;
   }).then(kick, failed);
 });

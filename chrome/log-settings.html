@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Журналы смены — Школково</title>
+  <link rel="stylesheet" href="popup.css">
+  <script defer src="log-folder.js"></script>
+  <script defer src="log-settings.js"></script>
+</head>
+<body class="log-settings">
+  <main>
+    <h1>Журналы смены</h1>
+    <p>Выбери папку распакованного расширения Chrome. После смены файл журнала появится в её подпапке <code>logs</code>.</p>
+    <p id="log-folder-status" class="status" role="status">Проверяю доступ к папке…</p>
+    <p>Если Chrome предложит разрешить доступ при каждом посещении, выбери этот вариант. При временном разрешении оставь страницу открытой до конца смены.</p>
+    <p>Если папка недоступна, Chrome сохранит журнал в подпапку <code>logs</code> в папке загрузок.</p>
+    <button id="select-log-folder" type="button" disabled>Выбрать папку расширения</button>
+    <button id="grant-log-folder" type="button" hidden>Восстановить доступ</button>
+    <p id="log-folder-error" class="note" role="alert" hidden></p>
+    <p id="log-export-status" class="shift" role="status" hidden></p>
+  </main>
+</body>
+</html>
