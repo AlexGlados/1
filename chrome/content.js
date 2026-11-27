@@ -9,7 +9,7 @@
   const minute = 60_000;
   const day = 24 * 60 * minute;
   const retryGapDelay = 7_000;
-  const maxGapTargets = 8;
+  const headRetryDelay = 5_000;
   const latestPossibleAt = row => row.precision === 'day' ? row.at + day - 1 : row.at;
   const validPage = () => /^\/chat\/?$/u.test(location.pathname);
   const pageListeners = new AbortController();
@@ -23,9 +23,11 @@
   let activeSweep = null;
   let sweepTimer = null;
   let recoveryTimer = null;
-  let recovery = null;
+  let recoveryNeeded = false;
+  let recovering = false;
   let startupCutoff = null;
   let headThrough = null;
+  let headRetryAt = 0;
   let navigation = null;
   const positions = new Map();
   const ambiguous = new Set();
@@ -158,12 +160,19 @@
     if (Number.isFinite(startupCutoff) || activeSweep || activeRead || navigation) return;
     const root = dom.getVirtualList?.();
     const startedAt = Date.now();
+    if (headRetryAt > startedAt) {
+      scheduleCapture(headRetryAt - startedAt);
+      return;
+    }
     const limit = Number.isFinite(headThrough) ? Math.floor(headThrough / minute) * minute : null;
     if (!root || root.scrollTop < 1) {
       const snapshot = scan();
-      const coverage = listCoverage(snapshot, 0, row => limit === null || latestPossibleAt(row) < limit);
-      const complete = !snapshot.layout || coverage?.complete;
-      if (complete || !canInspect()) {
+      const coverage = listCoverage(snapshot, 0, row => limit !== null && latestPossibleAt(row) < limit);
+      const timed = new Set(snapshot.ordered.map(row => row.position));
+      const complete = snapshot.layout
+        ? (limit === null || coverage?.complete) && rowsHavePositions(snapshot) && coversPrefix(timed, coverage?.last)
+        : snapshot.unrecognized.length === 0;
+      if (!root || complete || !canInspect()) {
         void publish({ ...snapshot, headThrough: complete ? startedAt : null }, force);
         return;
       }
@@ -181,21 +190,29 @@
     const current = () => !controller.signal.aborted && session === startedSession && canInspect() && root.isConnected;
     const found = new Map();
     const conflicts = new Set();
+    const timed = new Set();
+    let positioned = true;
     let complete = false;
     try {
       if (limit !== null) {
         const deadline = startedAt + 15_000;
         const outcome = await walkList(root, controller.signal, () => current() && Date.now() < deadline,
-          frame => rememberRows(found, conflicts, frame), row => latestPossibleAt(row) < limit);
-        complete = outcome.complete;
-      } else {
-        complete = true;
+          frame => {
+            rememberRows(found, conflicts, frame);
+            for (const row of frame.ordered) timed.add(row.position);
+            positioned &&= rowsHavePositions(frame);
+          }, row => latestPossibleAt(row) < limit);
+        complete = outcome.complete && positioned && coversPrefix(timed, outcome.last);
       }
       if (!current()) return;
       await moveList(root, 0, controller.signal);
       if (!current() || dom.getVirtualList?.() !== root || root.scrollTop >= 1) return;
       const snapshot = scan();
       if (!snapshot.ready) return;
+      if (limit === null) {
+        const coverage = listCoverage(snapshot, 0, () => false);
+        complete = rowsHavePositions(snapshot) && coversPrefix(new Set(snapshot.ordered.map(row => row.position)), coverage?.last);
+      }
       rememberRows(found, conflicts, snapshot);
       const rows = [...found.values()].filter(row => !conflicts.has(row.id));
       for (const row of rows) if (Number.isSafeInteger(row.position)) positions.set(row.id, row.position);
@@ -205,9 +222,24 @@
       if (activeSweep === controller) activeSweep = null;
       if (session === startedSession && canInspect()) {
         void send({ type: 'monitor:wake', session });
-        if (!complete) scheduleCapture(2_000);
+        if (!complete) {
+          headRetryAt = Date.now() + headRetryDelay;
+          scheduleCapture(headRetryDelay);
+        }
       }
     }
+  }
+
+  function coversPrefix(timed, last) {
+    if (!Number.isSafeInteger(last) || last < 1) return false;
+    let covered = 0;
+    for (const position of timed) if (position >= 1 && position <= last) covered++;
+    return covered === last;
+  }
+
+  function rowsHavePositions(frame) {
+    return frame.layout?.positions.every(({ position }) => Number.isSafeInteger(position) &&
+      position > 0 && position <= frame.layout.total);
   }
 
   function listCoverage(frame, previousLast, pastLimit) {
@@ -351,76 +383,88 @@
   }
 
   function recordGaps(last, timed, keys, unrecognized) {
-    const targets = [...keys]
-      .filter(([position]) => position <= last && !timed.has(position))
-      .slice(0, maxGapTargets)
-      .map(([position, key]) => ({ position, key, tries: 0 }));
+    if (!last) return { skipped: unrecognized.size, ranges: [...unrecognized].map(key => ({ key })) };
+    const positions = [...new Set([...timed, ...keys.keys()])]
+      .filter(position => position > 0 && position <= last).sort((a, b) => a - b);
+    const ranges = [];
     let skipped = 0;
-    const positions = [...timed].filter(position => position <= last).sort((a, b) => a - b);
     let prior = 0;
     for (const position of [...positions, last + 1]) {
-      skipped += position - prior - 1;
-      for (let missing = prior + 1; missing < position && targets.length < maxGapTargets; missing++) {
-        if (!keys.has(missing)) targets.push({ position: missing, tries: 0 });
+      if (position > prior + 1) {
+        ranges.push({ first: prior + 1, last: position - 1 });
+        skipped += position - prior - 1;
+      }
+      if (position <= last && !timed.has(position)) {
+        ranges.push({ first: position, last: position, key: keys.get(position) });
+        skipped++;
       }
       prior = position;
     }
-    if (!last) {
-      skipped += unrecognized.size;
-      for (const key of unrecognized) {
-        if (targets.length >= maxGapTargets) break;
-        targets.push({ key, tries: 0 });
+    const positioned = new Set(keys.values());
+    for (const key of unrecognized) {
+      if (!positioned.has(key)) {
+        ranges.push({ key });
+        skipped++;
       }
     }
-    return { skipped, targets };
+    return { skipped, ranges };
   }
 
   function scheduleRecovery() {
-    if (recovery?.expiresAt <= Date.now()) recovery = null;
-    if (!session || !recovery?.targets.length || recoveryTimer !== null || !contextActive()) return;
+    if (!session || !recoveryNeeded || recovering || recoveryTimer !== null || !contextActive()) return;
     recoveryTimer = setTimeout(() => {
       recoveryTimer = null;
-      void recoverSkipped().catch(() => {}).finally(scheduleRecovery);
+      recovering = true;
+      void recoverSkipped().catch(() => {}).finally(() => {
+        recovering = false;
+        scheduleRecovery();
+      });
     }, retryGapDelay);
   }
 
   async function recoverSkipped() {
-    if (!recovery?.targets.length || recovery.expiresAt <= Date.now() || activeRead || activeSweep || navigation || !canInspect()) return;
-    const state = recovery;
+    const available = () => !activeRead && !activeSweep && !navigation && canInspect();
+    if (!recoveryNeeded || !available()) return;
     const startedSession = session;
-    const target = state.targets.shift();
+    const reply = await send({ type: 'monitor:recovery-next', session });
+    if (!reply?.ok || session !== startedSession) return;
+    const batch = reply.recovery;
+    if (!batch) {
+      recoveryNeeded = false;
+      return;
+    }
+    if (!available() || !scan().ready) return;
     const controller = new AbortController();
     activeSweep = controller;
     const root = dom.getVirtualList?.();
-    const current = () => recovery === state && session === startedSession && !controller.signal.aborted && canInspect();
-    const deadline = Date.now() + 1_200;
-    let resolved = false;
+    const current = () => session === startedSession && !controller.signal.aborted && canInspect() &&
+      (!root || (root.isConnected && dom.getVirtualList?.() === root));
+    const results = [];
+    const rows = new Map();
     try {
-      if (root && Number.isSafeInteger(target.position)) {
-        await showPosition(root, target.position, controller.signal, () => current() && Date.now() < deadline);
+      for (const { position, key } of batch.targets) {
+        if (!current()) return;
+        if (root && Number.isSafeInteger(position)) {
+          const deadline = Date.now() + 1_200;
+          await showPosition(root, position, controller.signal, () => current() && Date.now() < deadline);
+        }
+        if (!current()) return;
+        const snapshot = scan();
+        if (!snapshot.ready) return;
+        const row = snapshot.rows.find(item => key ? item.id === key : item.position === position);
+        const resolved = Boolean(row && !ambiguous.has(row.id));
+        results.push({ ...(Number.isSafeInteger(position) ? { position } : {}), ...(key ? { key } : {}), resolved });
+        if (resolved && row.precision !== 'day' && row.at > batch.cutoff) rows.set(row.id, row);
       }
-      if (!current() || (root && !root.isConnected)) return;
-      const snapshot = scan();
-      const row = snapshot.rows.find(item => target.key ? item.id === target.key : item.position === target.position);
-      if (!row || ambiguous.has(row.id)) return;
       if (root) await moveList(root, 0, controller.signal);
       if (!current()) return;
-      const rows = row.precision !== 'day' && row.at > state.cutoff ? [row] : [];
-      const scanned = state.scanned + rows.length;
-      const result = await reportCoverage(true, scanned, '', {
-        recovery: true, observedAt: Date.now(), rows, skipped: state.skipped - 1
+      await reportCoverage(true, null, '', {
+        recovery: true, recoveryId: batch.id, results, observedAt: Date.now(), rows: [...rows.values()]
       });
-      if (result?.ok && recovery === state) {
-        state.skipped--;
-        state.scanned = scanned;
-        resolved = true;
-      }
     } finally {
-      if (current() && root && root.scrollTop >= 1) await moveList(root, 0, controller.signal).catch(() => {});
+      if (current() && root?.scrollTop >= 1) await moveList(root, 0, controller.signal).catch(() => {});
       if (activeSweep === controller) activeSweep = null;
-      if (recovery === state && session === startedSession) {
-        if (!resolved && ++target.tries < 2) state.targets.push(target);
-        if (!state.targets.length) recovery = null;
+      if (session === startedSession) {
         if (canInspect()) void send({ type: 'monitor:wake', session });
         scheduleCapture();
       }
@@ -486,16 +530,14 @@
       const observedAt = Date.now();
       const rows = [...found.values()].filter(row => !ambiguous.has(row.id) && row.precision !== 'day' && row.at > cutoff);
       for (const row of rows) if (Number.isSafeInteger(row.position)) positions.set(row.id, row.position);
-      const { skipped, targets } = recordGaps(last, timed, keys, unrecognized);
+      const { skipped, ranges } = recordGaps(last, timed, keys, unrecognized);
       const result = await reportCoverage(complete, rows.length, complete ? '' : 'Не удалось завершить начальный просмотр чатов.',
-        { observedAt, rows, skipped, ...(complete ? { headThrough: startedAt } : {}) });
+        { observedAt, rows, skipped, ...(complete ? { headThrough: startedAt, recoveryRanges: ranges } : {}) });
       if (complete && result?.ok && session === startedSession) {
         startupCutoff = null;
         headThrough = Math.max(headThrough ?? -Infinity, startedAt);
-        if (targets.length) {
-          recovery = { targets, skipped, cutoff, scanned: rows.length, expiresAt: Date.now() + 2 * minute };
-          scheduleRecovery();
-        }
+        recoveryNeeded = ranges.length > 0;
+        scheduleRecovery();
       }
     } finally {
       if (activeSweep === controller) activeSweep = null;
@@ -522,7 +564,8 @@
       captureTimer = null;
       sweepTimer = null;
       recoveryTimer = null;
-      recovery = null;
+      recoveryNeeded = !!next && !Number.isFinite(cutoff);
+      headRetryAt = 0;
       minuteWatch = null;
       positions.clear();
       ambiguous.clear();
@@ -546,6 +589,7 @@
       }
     } else if (cutoff === null && startupCutoff !== null) {
       startupCutoff = null;
+      recoveryNeeded = true;
       activeSweep?.abort();
       clearTimeout(sweepTimer);
       sweepTimer = null;
@@ -555,6 +599,7 @@
       lastCapture = '';
       scheduleCapture(250);
       scheduleSweep();
+      scheduleRecovery();
     }
   }
 
@@ -728,31 +773,34 @@
   async function read(request) {
     const { id, job = {} } = request;
     const rowKey = job.rowKey || id;
-    const fail = (reason, blocked = false) => {
+    const fail = (reasonCode, reason, blocked = false) => {
       const tabBlock = blocked ? inspectionBlock() : '';
-      return { id, ready: false, reason, blocked, complete: false, messages: [], ...(tabBlock ? { tabBlock } : {}) };
+      return { id, ready: false, reasonCode, reason, blocked, complete: false, messages: [], ...(tabBlock ? { tabBlock } : {}) };
     };
     const expiresAt = Math.min(request.expiresAt ?? Date.now() + 25_000, job.expiresAt ?? Infinity);
     const minActivityAt = job.minActivityAt ?? Date.now() - dom.recentWindow;
     const allowed = () => session === request.session && canInspect() && Date.now() < expiresAt;
     if (!session || request.session !== session || activeRead || navigation || !allowed()) {
-      return fail('Вкладка занята или время запроса истекло.', true);
+      return fail('read_error', 'Вкладка занята или время запроса истекло.', true);
     }
-    if (activeSweep) return { ...fail('Обновляется список чатов.', true), tabBlock: 'list_scan' };
+    if (activeSweep) return { ...fail('read_error', 'Обновляется список чатов.', true), tabBlock: 'list_scan' };
     const controller = new AbortController();
     activeRead = controller;
     try {
       const row = lookup(rowKey) || await seekRow(rowKey, job.position, controller.signal, allowed,
         Math.min(expiresAt - 750, Date.now() + 10_000), minActivityAt, Math.max(minActivityAt, job.at ?? minActivityAt));
-      if (!row || !row.element.isConnected) return fail('Строка чата недоступна.', controller.signal.aborted || !allowed());
+      if (!row || !row.element.isConnected) {
+        return fail('row_unavailable', 'Строка чата недоступна.', controller.signal.aborted || !allowed());
+      }
       if (controller.signal.aborted || !allowed() || !Number.isFinite(row.at) ||
-          latestPossibleAt(row) < minActivityAt) return fail('Чат вышел из окна проверки или вкладка занята.', true);
+          latestPossibleAt(row) < minActivityAt) return fail('row_unavailable', 'Чат вышел из окна проверки или вкладка занята.', true);
       const expected = request.identity || job.identity;
       const previousPanel = dom.getChat();
       const switchChat = !panelMatches(previousPanel, row, expected) || row.selected === false;
       if (switchChat) row.element.click();
       let chat = await waitPanel(row, expected, controller, null, switchChat ? previousPanel : null, allowed);
-      if (!chat) return fail('Не удалось подтвердить переписку, её автора и время последнего сообщения.', controller.signal.aborted || !allowed());
+      if (!chat) return fail('history_unconfirmed', 'Не удалось подтвердить переписку, её автора и время последнего сообщения.',
+        controller.signal.aborted || !allowed());
       const sinceAt = request.sinceAt ?? job.sinceAt;
       const coveredPin = value => !row.pinned || !Number.isFinite(sinceAt) || value.historyComplete ||
         value.messages[0].time < sinceAt || value.messages.some(message => message.id &&
@@ -767,12 +815,12 @@
         if (!more) break;
         chat = more;
       }
-      if (controller.signal.aborted || !allowed()) return fail('Чтение прервано.', true);
+      if (controller.signal.aborted || !allowed()) return fail('read_error', 'Чтение прервано.', true);
       const latestRow = lookup(rowKey);
       const latest = dom.getChat();
       if (ambiguous.has(rowKey) || latestRow?.selected === false || !panelMatches(latest, row, chat.id) ||
           latest.messages.at(-1).time < minActivityAt) {
-        return fail('Вкладка или переписка изменилась.');
+        return fail('panel_changed', 'Вкладка или переписка изменилась.');
       }
       const messages = metadata(latest);
       watchMinute(latestRow || row, latest.id, job, messages);
@@ -829,7 +877,7 @@
   }
 
   function canReload() {
-    if (!session || !contextActive() || Number.isFinite(startupCutoff) || recovery?.expiresAt > Date.now() || activeRead || activeSweep || navigation ||
+    if (!session || !contextActive() || Number.isFinite(startupCutoff) || activeRead || activeSweep || navigation ||
         protectionReason() || !navigator.onLine) return false;
     connection.refresh();
     return !['connecting', 'offline'].includes(connection.details().connection);
@@ -883,7 +931,9 @@
         reply(session && request.session === session ? rowsSnapshot() : { ready: false });
         break;
       case 'monitor:read':
-        void read(request).then(reply, () => reply({ id: request.id, ready: false, complete: false, messages: [], reason: 'Ошибка чтения интерфейса.' }));
+        void read(request).then(reply, () => reply({
+          id: request.id, ready: false, complete: false, messages: [], reasonCode: 'read_error', reason: 'Ошибка чтения интерфейса.'
+        }));
         return true;
       case 'monitor:open':
         void open(request).then(reply, () => reply({ ok: false, reason: 'Не удалось открыть чат.' }));

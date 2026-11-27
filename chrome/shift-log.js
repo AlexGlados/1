@@ -18,10 +18,11 @@
     log.events.push(event);
   }
 
-  function hold(log, event) {
-    const held = log.held ??= { events: [], hours: {} };
+  function hold(owner, event) {
+    const held = owner.held ??= { events: [], hours: {} };
     const hour = engine.calendarPeriodAt(event.at);
     const totals = held.hours[hour] ??= { checked: 0, notified: 0, omitted: 0 };
+    totals.firstAt = Math.min(totals.firstAt ?? Infinity, event.at);
     if (event.event === 'chat_checked') totals.checked += 1;
     if (event.event === 'notification_delivered' && !['offline', 'connecting'].includes(event.details?.kind)) {
       totals.notified += 1;
@@ -38,11 +39,14 @@
     if (!held) return;
     held.events = held.events.filter(event => {
       if (event.at >= cutoff) return true;
+      log.openedAt = Math.min(log.openedAt, event.at);
       append(log, event);
       return false;
     });
     for (const [period, totals] of Object.entries(held.hours)) {
       if (Number(period) >= cutoff) continue;
+      if (Number.isFinite(totals.firstAt)) log.openedAt = Math.min(log.openedAt, totals.firstAt);
+      else if (totals.omitted) log.openedAt = Math.min(log.openedAt, Number(period));
       log.omitted += totals.omitted;
       delete held.hours[period];
     }
@@ -51,29 +55,48 @@
 
   function record(s, at, event, details) {
     const log = s.shiftLogs?.active;
-    if (!log) return;
     const entry = details ? { at, event, details } : { at, event };
-    if (Number.isFinite(log.lastDutyPeriod) && at >= log.lastDutyPeriod + HOUR) hold(log, entry);
-    else append(log, entry);
+    if (log) {
+      if (Number.isFinite(log.lastDutyPeriod) && at >= log.lastDutyPeriod + HOUR) hold(log, entry);
+      else append(log, entry);
+    } else if (at >= s.shiftLogs?.review?.period) {
+      hold(s.shiftLogs.review, entry);
+    }
   }
 
-  function start(s, now) {
-    const logs = journal(s);
-    if (logs.active) {
-      record(s, now, 'monitor_resumed');
-      return;
-    }
-    logs.active = {
+  function begin(s, now) {
+    const log = journal(s).active = {
       id: crypto.randomUUID(), openedAt: now, firstDutyPeriod: null, lastDutyPeriod: null,
       nextOnDuty: null, dutyMatchVersion: DUTY_MATCH_VERSION,
       initialChecked: s.checked || 0, initialNotified: s.notified || 0, events: [], omitted: 0
     };
     record(s, now, 'monitor_started', { mode: s.scan.mode, pinnedInstant: s.scan.pinnedImmediate !== false });
+    return log;
+  }
+
+  function start(s, now) {
+    if (s.shiftLogs?.active || s.shiftLogs?.review) record(s, now, 'monitor_resumed');
+    else begin(s, now);
+  }
+
+  function startFromReview(s, now) {
+    const { review } = s.shiftLogs;
+    const { period, held } = review;
+    delete s.shiftLogs.review;
+    const first = held.hours[period];
+    const earliest = first?.firstAt ?? held.events.find(event => engine.calendarPeriodAt(event.at) === period)?.at ?? period;
+    const log = begin(s, Math.min(now, earliest));
+    log.held = held;
+    for (const totals of Object.values(held.hours)) {
+      log.initialChecked -= totals.checked;
+      log.initialNotified -= totals.notified;
+    }
+    return log;
   }
 
   function finish(s, endedAt, reason, details, now = endedAt) {
     const logs = s.shiftLogs;
-    const log = logs?.active;
+    const log = logs?.active ?? (logs?.review && reason !== 'schedule' ? startFromReview(s, endedAt) : null);
     if (!log) return;
     // A delayed schedule lookup can close an earlier session while monitoring is already awake again.
     acceptBefore(log, reason === 'schedule' ? endedAt : Infinity);
@@ -110,15 +133,14 @@
     });
   }
 
-  function acceptCurrentHour(log, period, held) {
-    const totals = held?.hours[period];
-    if (!totals) return;
-    log.initialChecked -= totals.checked;
-    log.initialNotified -= totals.notified;
-    log.omitted += totals.omitted;
-    for (const event of held.events) {
-      if (engine.calendarPeriodAt(event.at) === period) append(log, event);
+  function remainingHours(held, after) {
+    if (!held) return null;
+    held.events = held.events.filter(event => event.at >= after);
+    for (const hour of Object.keys(held.hours)) {
+      if (Number(hour) < after) delete held.hours[hour];
     }
+    const period = Math.min(...Object.keys(held.hours).map(Number));
+    return Number.isFinite(period) ? { period, held } : null;
   }
 
   function observe(s, now, enabled, confirmed) {
@@ -134,27 +156,40 @@
     const onDuty = roster => roster ? engine.curatorDuty(scan, roster.names, roster.directory) : null;
 
     const currentDuty = onDuty(rosterAt(calendar));
-    let log = s.shiftLogs?.active;
-    let held;
-    migrateDutyMatch(log);
-    while (Number.isFinite(log?.lastDutyPeriod)) {
+    const logs = s.shiftLogs;
+    migrateDutyMatch(logs?.active);
+    while (logs?.active || logs?.review) {
+      if (logs.review) {
+        const { period, held, id } = logs.review;
+        if (period > calendar) break;
+        const duty = onDuty(rosterAt(period));
+        if (duty === null) break;
+        if (duty) {
+          markDuty(startFromReview(s, now), period, now);
+        } else {
+          const remaining = remainingHours(held, period + HOUR);
+          if (remaining) logs.review = { ...remaining, id };
+          else delete logs.review;
+        }
+        continue;
+      }
+
+      const log = logs.active;
+      if (!Number.isFinite(log.lastDutyPeriod)) break;
       const next = log.lastDutyPeriod + HOUR;
       const upcoming = rosterAt(next);
       if (upcoming) log.nextOnDuty = onDuty(upcoming);
       if (now < next || typeof log.nextOnDuty !== 'boolean') break;
       if (!log.nextOnDuty) {
-        held = finish(s, next, 'schedule', undefined, now);
-        log = null;
-        break;
+        const remaining = remainingHours(finish(s, next, 'schedule', undefined, now), next + HOUR);
+        if (remaining) logs.review = { ...remaining, id: crypto.randomUUID() };
+      } else {
+        markDuty(log, next, now);
       }
-      markDuty(log, next, now);
     }
-    if (currentDuty === true && (enabled || log) && !Number.isFinite(log?.lastDutyPeriod)) {
-      if (!log) {
-        start(s, now);
-        log = s.shiftLogs.active;
-        acceptCurrentHour(log, calendar, held);
-      }
+    if (!logs?.review && currentDuty === true && (enabled || logs?.active) &&
+        !Number.isFinite(logs?.active?.lastDutyPeriod)) {
+      const log = logs?.active ?? begin(s, now);
       markDuty(log, calendar, now);
       log.nextOnDuty = onDuty(rosterAt(calendar + HOUR));
     }
@@ -162,10 +197,14 @@
 
   function missingHour(s, now) {
     const log = s.shiftLogs?.active;
-    if (!Number.isFinite(log?.lastDutyPeriod) || typeof log.nextOnDuty === 'boolean') return null;
-    const next = log.lastDutyPeriod + HOUR;
+    const next = s.shiftLogs?.review?.period ?? log?.lastDutyPeriod + HOUR;
+    if (!Number.isFinite(next) || typeof log?.nextOnDuty === 'boolean') return null;
     const calendar = engine.calendarPeriodAt(now);
     return next < calendar || (!s.scan.enabled && next === calendar) ? next : null;
+  }
+
+  function lookupId(s) {
+    return s.shiftLogs?.review?.id ?? s.shiftLogs?.active?.id;
   }
 
   function confirmHour(s, now, period, names, directory = []) {
@@ -206,6 +245,6 @@
   }
 
   globalThis.ShkolkovoShiftLog = Object.freeze({
-    start, record, observe, missingHour, confirmHour, finish, nextBoundary, filename, render
+    start, record, observe, missingHour, lookupId, confirmHour, finish, nextBoundary, filename, render
   });
 })();

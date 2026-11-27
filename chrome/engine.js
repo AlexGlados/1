@@ -7,6 +7,9 @@
   const RECENT_MAX_AGE = 20 * MIN; // Fresh activity for ordinary unbound reads and alerts.
   const STARTUP_MAX_AGE = 45 * MIN;
   const WAIT_MAX_AGE = 12 * HOUR;
+  const READ_FAILURE_CODES = new Set([
+    'row_unavailable', 'history_unconfirmed', 'panel_changed', 'read_error', 'tab_no_response'
+  ]);
   const minute = at => Math.floor(at / MIN) * MIN;
   // Moscow is UTC+3, an integral number of hours. Epoch-hour boundaries coincide.
   const calendarPeriodAt = now => Math.floor(now / HOUR) * HOUR;
@@ -774,7 +777,9 @@
     const continuing = waitIndex >= 0 && waitIndex > replyIndex;
     const atStart = h.startReached === true || (h.startReached === undefined && h.complete === true);
     const last = messages.at(-1);
-    if (afterReply.some(m => !knownRole(m))) return { reason: 'Не удалось однозначно определить автора сообщения.' };
+    if (afterReply.some(m => !knownRole(m))) {
+      return { reasonCode: 'message_author_unknown', reason: 'Не удалось однозначно определить автора сообщения.' };
+    }
     const first = afterReply.find(asks);
     const needsHistory = (first || c.waitKey) && !reply && !atStart && !continuing;
     let wait = continuing && !reply && !atStart ? messages[waitIndex] : first;
@@ -784,7 +789,9 @@
         // in an otherwise verified tail gives a conservative new baseline.
         wait = afterReply.find(message => asks(message) && now - message.at <= RECENT_MAX_AGE);
       } else wait = null;
-      if (!wait) return { reason: 'Не подтверждено начало истории или последний ответ куратора.' };
+      if (!wait) {
+        return { reasonCode: 'history_anchor_missing', reason: 'Не подтверждено начало истории или последний ответ куратора.' };
+      }
     } else if (tooOld(wait?.at, now)) {
       const confirmed = continuing && messages[waitIndex];
       // Keep a replacement already confirmed for this unanswered episode.
@@ -804,10 +811,12 @@
     const baselineOnly = !floor.keys && last.at <= floor.at && anchor < 0;
     if (messages[0].at >= floor.at && !baselineOnly && anchor < 0 && !h.startReached && !h.sinceCovered &&
         !(h.complete && h.startReached === undefined)) {
-      return { reason: 'Не загрузились сообщения до предыдущей проверки закреплённого чата.' };
+      return { reasonCode: 'pinned_history_incomplete', reason: 'Не загрузились сообщения до предыдущей проверки закреплённого чата.' };
     }
     const freshMessages = anchor >= 0 ? messages.slice(anchor + 1) : messages.filter(m => m.at > floor.at);
-    if (freshMessages.some(m => !knownRole(m))) return { reason: 'Не удалось определить автора сообщения в закреплённом чате.' };
+    if (freshMessages.some(m => !knownRole(m))) {
+      return { reasonCode: 'message_author_unknown', reason: 'Не удалось определить автора сообщения в закреплённом чате.' };
+    }
     return freshMessages.filter(m => m.role === 'student');
   }
   function canRebind(c, messages) {
@@ -837,23 +846,38 @@
     return notice(c, 'free', 'now', c.waitSince, c.waitKey, now);
   }
 
-  function apply(s, job, history, now) {
+  function apply(s, job, history, now, check) {
     const h = history;
     let c = valid(s, job, now);
     if (!c) return [];
-    if (!h?.ready || h.id !== c.id || !Array.isArray(h.messages) || !h.messages.length ||
-        (c.identity && c.identity !== h.identity) ||
+    const fail = (reasonCode, reason) => {
+      if (check) check.reasonCode = reasonCode;
+      return retry(c, reason, now);
+    };
+    const unconfirmed = 'Не подтверждены нужная переписка и загрузка истории.';
+    if (!h?.ready) {
+      const code = READ_FAILURE_CODES.has(h?.reasonCode) ? h.reasonCode : 'history_unconfirmed';
+      return fail(code, h?.reason || unconfirmed);
+    }
+    if (h.id !== c.id || (c.identity && c.identity !== h.identity) ||
         ((fallbackId(c.id) || c.id.startsWith('id:')) && !platformId(h.identity))) {
-      return retry(c, h?.reason || 'Не подтверждены нужная переписка и загрузка истории.', now);
+      return fail('chat_identity_unconfirmed', unconfirmed);
     }
     const messages = h.messages;
-    if (messages.some((m, i) => !Number.isFinite(m.at) || m.at > now || (i && messages[i - 1].at > m.at)) ||
-        minute(messages.at(-1).at) < minute(job.at)) return retry(c, 'История не соответствует последней активности.', now);
+    if (!Array.isArray(messages) || !messages.length) return fail('history_empty', unconfirmed);
+    if (messages.some((m, i) => !Number.isFinite(m?.at) || m.at > now || (i && messages[i - 1].at > m.at))) {
+      return fail('message_time_invalid', 'История не соответствует последней активности.');
+    }
+    if (minute(messages.at(-1).at) < minute(job.at)) {
+      return fail('activity_mismatch', 'История не соответствует последней активности.');
+    }
     if (platformId(h.identity) && messages.some(m => typeof m.id !== 'string' || !m.id)) {
-      return retry(c, 'Не подтверждены идентификаторы сообщений.', now);
+      return fail('message_id_missing', 'Не подтверждены идентификаторы сообщений.');
     }
     const list = keyed(messages);
-    if (new Set(list.map(m => m.key)).size !== list.length) return retry(c, 'Идентификаторы сообщений повторяются.', now);
+    if (new Set(list.map(m => m.key)).size !== list.length) {
+      return fail('message_id_duplicate', 'Идентификаторы сообщений повторяются.');
+    }
     const last = list.at(-1);
     if (last.at < minActivityAt(c, now, c.pending.startupCutoff)) {
       c.pending = null;
@@ -861,7 +885,9 @@
       return [];
     }
     if (job.signal != null && !String(job.signal).startsWith('panel:') && last.id != null && minute(last.at) === minute(job.at) &&
-        String(job.signal) !== String(last.id)) return retry(c, 'Идентификатор последнего сообщения ещё не совпал со списком.', now);
+        String(job.signal) !== String(last.id)) {
+      return fail('last_message_id_mismatch', 'Идентификатор последнего сообщения ещё не совпал со списком.');
+    }
     if (h.identity) {
       c = identify(s, c, h.identity);
       if (c.identity == null) c.identity = h.identity;
@@ -882,19 +908,20 @@
     if (student && !tooOld(student.at, now) && Object.hasOwn(s.inactiveRows ?? {}, c.id)) delete s.inactiveRows[c.id];
     const facts = historyFacts(c, h, list, now);
     const pinMessages = newPinnedMessages(c, h, list);
-    if (facts.reason || pinMessages.reason) return retry(c, facts.reason || pinMessages.reason, now);
+    const failure = facts.reason ? facts : pinMessages.reason ? pinMessages : null;
+    if (failure) return fail(failure.reasonCode, failure.reason);
     const { reply, wait, lastReplyAt, lastReplyKey } = facts;
     if (student) {
       c.lastStudentKey = student.key;
       c.lastStudentAt = student.at;
     }
     if (c.pending.reason === 'off-duty-review' && !reply && h.startReached !== true) {
-      return retry(c, 'Не подтверждён автор последнего ответа куратора.', now);
+      return fail('curator_reply_unconfirmed', 'Не подтверждён автор последнего ответа куратора.');
     }
     const { curator, uncertain, offDuty } = rosterMatch(reply, s);
     const transferAt = c.transferAt ?? c.transferReviewAt;
     if (uncertain && (recentReply(reply, now) || c.binding || transferAt != null)) {
-      const notices = retry(c, 'Не удалось однозначно сопоставить куратора с расписанием.', now);
+      const notices = fail('curator_ambiguous', 'Не удалось однозначно сопоставить куратора с расписанием.');
       // A known curator role establishes a reply even if the schedule cannot
       // distinguish two people by name. Retry ownership without reviving a wait.
       if (!wait || (c.waitKey && c.waitKey !== wait.key)) {
@@ -989,6 +1016,7 @@
       if (duplicate >= 0) result.splice(duplicate, 1);
       result.push(initial);
     }
+    if (check) check.status = c.status;
     return result;
   }
 

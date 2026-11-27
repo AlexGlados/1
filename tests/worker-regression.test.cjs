@@ -20,12 +20,17 @@ async function settle() {
 
 function fixture() {
   let now = START;
+  let documentId = 'doc';
+  let nextTab = 2;
   const values = {};
   const session = { 'shkolkovo.browserSession': 'fixture-boot' };
   const notifications = {};
   const reads = [];
+  const created = [];
+  const removed = [];
   const alarms = new Map();
   const tab = { id: 1, windowId: 1, status: 'complete', active: false, autoDiscardable: false };
+  const tabs = new Map([[tab.id, tab]]);
   const controls = {
     failAlarm: false, failStorage: false, ping: true, connection: 'offline',
     schedule: async () => ({ names: ['Иван Петров'], directory: ['Иван Петров'] }),
@@ -44,7 +49,7 @@ function fixture() {
     };
   }
   const chrome = {
-    runtime: { id: 'regression', getManifest: () => ({ version: '1.11.0' }), getURL: file => ORIGIN + file,
+    runtime: { id: 'regression', getManifest: () => ({ version: '1.11.1' }), getURL: file => ORIGIN + file,
       onMessage: event(), onInstalled: event(), onStartup: event() },
     storage: { local: storage(values), session: storage(session) },
     alarms: {
@@ -61,16 +66,30 @@ function fixture() {
     },
     tabs: {
       onUpdated: event(), onRemoved: event(),
-      get: async () => ({ ...tab }),
-      update: async (_, fields) => {
+      get: async id => {
+        if (!tabs.has(id)) throw new Error('tab missing');
+        return { ...tabs.get(id) };
+      },
+      create: async options => {
+        const tab = { id: nextTab++, windowId: 1, status: 'loading', autoDiscardable: true, ...options };
+        tabs.set(tab.id, tab);
+        created.push(tab.id);
+        return { ...tab };
+      },
+      remove: async id => {
+        tabs.delete(id);
+        removed.push(id);
+      },
+      update: async (id, fields) => {
         controls.lastTabUpdate = fields;
-        return Object.assign(tab, fields);
+        return Object.assign(tabs.get(id), fields);
       },
       sendMessage: async (_, request) => {
         if (request.type === 'monitor:ping') return controls.ping ? { ok: true } : null;
         if (request.type === 'monitor:snapshot') return { connection: controls.connection };
         if (request.type === 'monitor:read') {
           reads.push(request.id);
+          if (controls.read) return controls.read(request);
           return { id: request.id, ready: true, startReached: true, complete: true,
             messages: [{ id: 'message', role: 'service', author: 'Сервис', at: request.job.at }] };
         }
@@ -117,13 +136,20 @@ function fixture() {
   const dispatch = (sender, message) => new Promise(resolve => {
     assert.equal(chrome.runtime.onMessage.emit(message, { id: 'regression', ...sender }, resolve), true);
   });
+  const fromContent = (type, fields) => dispatch({ url: CHAT_URL, tab: { id: 1 }, frameId: 0, documentId },
+    { type, session: String(state.scan.generation), observedAt: now, ...fields });
   return {
-    state, controls, reads, notifications, saved: () => values[MONITOR_KEY],
+    state, controls, reads, notifications, created, removed, saved: () => values[MONITOR_KEY],
     advance: delta => { now += delta; },
     plan: () => vm.runInContext('plan()', context),
     popup: type => dispatch({ url: ORIGIN + 'popup.html' }, { type }),
-    report: fields => dispatch({ url: CHAT_URL, tab: { id: 1 }, frameId: 0, documentId: 'doc' },
-      { type: 'monitor:coverage', session: String(state.scan.generation), observedAt: now, ...fields }),
+    report: fields => fromContent('monitor:coverage', fields),
+    recovery: () => fromContent('monitor:recovery-next'),
+    async reload() {
+      chrome.tabs.onUpdated.emit(tab.id, { status: 'loading' });
+      documentId = 'new-document';
+      await fromContent('monitor:hello');
+    },
     prepareReport() {
       context.testState = state;
       vm.runInContext("shiftLog.start(testState, Date.now()); shiftLog.finish(testState, Date.now(), 'manual');", context);
@@ -196,16 +222,82 @@ test('recognized rows are read before startup completes and a later replay does 
   await f.plan();
   await settle();
   assert.deepEqual(f.reads, ['recognized']);
-  assert.equal((await f.report({ complete: true, partial: true, skipped: 1, scanned: 1, rows })).ok, true);
+  assert.equal((await f.report({ complete: true, partial: true, skipped: 1, scanned: 1, rows,
+    recoveryRanges: [{ first: 2, last: 2 }] })).ok, true);
   await f.plan();
   await settle();
   assert.deepEqual(f.reads, ['recognized']);
   assert.match((await f.popup('ui:status')).scanStatus, /— 1/);
-  assert.equal((await f.report({ complete: true, recovery: true, partial: true, skipped: 0,
+  const { recovery } = await f.recovery();
+  assert.equal((await f.report({ recovery: true, recoveryId: recovery.id, results: [{ position: 2, resolved: true }],
     rows: [{ id: 'recovered', title: 'Fixture', at: START - 35 * MINUTE, precision: 'minute' }] })).ok, true);
   await f.plan();
   await settle();
   assert.deepEqual(f.reads, ['recognized', 'recovered']);
+});
+
+test('all 181 skipped positions receive a bounded attempt and an in-flight batch survives reload', async () => {
+  const f = fixture();
+  f.state.scan.startupCutoff = START - 45 * MINUTE;
+  assert.equal((await f.report({ complete: true, partial: true, skipped: 181, scanned: 0, rows: [],
+    recoveryRanges: [{ first: 2, last: 182 }] })).ok, true);
+  const first = (await f.recovery()).recovery;
+  assert.equal(first.targets.length, 8);
+  assert.equal(first.targets[0].position, 2);
+  await f.reload();
+  assert.equal((await f.recovery()).recovery.id, first.id);
+  const attempted = [];
+  let batch = first;
+  while (batch) {
+    assert.ok(batch.targets.length <= 8);
+    const results = batch.targets.map(({ position }) => ({ position, resolved: position !== 2 }));
+    attempted.push(...results.map(result => result.position));
+    const report = { recovery: true, recoveryId: batch.id, results, rows: [] };
+    assert.equal((await f.report(report)).ok, true);
+    assert.equal((await f.report(report)).ok, true);
+    batch = (await f.recovery()).recovery;
+    assert.ok(attempted.length <= 182);
+  }
+  assert.deepEqual(attempted, [...Array.from({ length: 181 }, (_, index) => index + 2), 2]);
+  assert.equal(f.saved().coverage.skipped, 1);
+});
+
+test('a rejected ready history logs a reason code without the chat or message metadata', async () => {
+  const f = fixture();
+  f.state.scan.startupCutoff = START - 45 * MINUTE;
+  f.controls.read = ({ id, job }) => ({ id, identity: '1__2__3', ready: true, startReached: true, complete: true,
+    messages: [{ at: job.at, role: 'student', author: 'Fixture name' }] });
+  await f.report({ complete: true, partial: true, recoveryRanges: [],
+    rows: [{ id: 'id:1__2__3', title: 'Fixture title', at: START - 5 * MINUTE, precision: 'minute' }] });
+  await f.plan();
+  await settle();
+  const failure = f.saved().shiftLogs.active.events.find(event => event.event === 'chat_check_failed');
+  assert.equal(failure.details.reason, 'message_id_missing');
+  assert.deepEqual(Object.keys(failure.details), ['reason']);
+  assert.equal(f.saved().checked, 0);
+});
+
+test('failed manual starts remove only the tabs the attempts created', async () => {
+  const f = fixture();
+  Object.assign(f.state, { tab: null, lastWatchTab: null, doc: null, ready: false });
+  f.state.scan.enabled = false;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    f.controls.failStorage = true;
+    assert.equal((await f.popup('ui:start')).ok, false);
+  }
+  assert.deepEqual(f.created, [2, 3]);
+  assert.deepEqual(f.removed, f.created);
+  assert.equal(f.saved().scan.enabled, false);
+});
+
+test('a failed manual start keeps a previously existing tab', async () => {
+  const f = fixture();
+  Object.assign(f.state, { tab: null, doc: null, ready: false });
+  f.state.scan.enabled = false;
+  f.controls.failStorage = true;
+  assert.equal((await f.popup('ui:start')).ok, false);
+  assert.deepEqual(f.created, []);
+  assert.deepEqual(f.removed, []);
 });
 
 test('a retired duty hour is requested after waking and closes only the journal', async () => {

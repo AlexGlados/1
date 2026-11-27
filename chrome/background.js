@@ -10,6 +10,7 @@ const MIN = 60_000;
 const TAB_RETRY = 10_000;
 const PAGE_CHECK_INTERVAL = 30_000;
 const JOURNAL_RETRY = 5 * MIN;
+const RECOVERY_BATCH_SIZE = 8;
 const TAB_BLOCKS = new Set(['in_use', 'draft', 'connection', 'loading', 'frozen', 'discarded', 'page', 'missing', 'list_scan']);
 const KEY = 'shkolkovo.monitor.v2';
 const BOOT = 'shkolkovo.browserSession';
@@ -101,7 +102,7 @@ function tx(fn, rollback) {
       return value;
     } catch (error) {
       db = JSON.parse(snapshot);
-      rollback?.();
+      await rollback?.();
       throw error;
     }
   });
@@ -152,6 +153,9 @@ async function monitorTab(s, onCreate) {
     if (route.boot === bootId) route.tab = tab.id;
   }
   return tab.id;
+}
+function removeCreatedMonitorTab(id) {
+  return chrome.tabs.remove(id).catch(() => {});
 }
 async function openShiftChat(id) {
   const dest = await tx(s => {
@@ -314,6 +318,79 @@ function rememberHead(scan, result) {
   }
 }
 
+function readRecoveryRanges(value) {
+  if (!Array.isArray(value)) return null;
+  const ranges = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') return null;
+    const { first, last, key } = item;
+    if (key !== undefined && (typeof key !== 'string' || !key)) return null;
+    if (first === undefined && last === undefined && key) {
+      ranges.push({ key, tries: 0 });
+    } else {
+      if (!Number.isSafeInteger(first) || !Number.isSafeInteger(last) || first < 1 || last < first ||
+          (key && first !== last)) return null;
+      ranges.push({ first, last, ...(key ? { key } : {}), tries: 0 });
+    }
+  }
+  return ranges;
+}
+
+function nextRecoveryBatch(coverage) {
+  const work = coverage?.recovery;
+  if (!coverage?.complete || !work) return null;
+  if (work.batch) return work.batch;
+  const targets = [];
+  while (targets.length < RECOVERY_BATCH_SIZE && work.ranges.length) {
+    const range = work.ranges[0];
+    const { first, last, key, tries } = range;
+    targets.push({ ...(first === undefined ? {} : { position: first }), ...(key ? { key } : {}), tries });
+    if (first === last) work.ranges.shift();
+    else range.first++;
+  }
+  if (!targets.length) return null;
+  work.batch = { id: crypto.randomUUID(), cutoff: coverage.cutoff, targets };
+  return work.batch;
+}
+
+function applyRecoveryBatch(s, message) {
+  const coverage = s.coverage;
+  const work = coverage?.recovery;
+  if (!coverage?.complete || !work || typeof message.recoveryId !== 'string') return false;
+  if (work.acknowledged === message.recoveryId) return true;
+  const batch = work.batch;
+  if (!batch || batch.id !== message.recoveryId || !Array.isArray(message.results) ||
+      message.results.length !== batch.targets.length || !Array.isArray(message.rows)) return false;
+  const results = new Map();
+  const targetKey = ({ position, key }) => JSON.stringify([position ?? null, key ?? null]);
+  for (const result of message.results) {
+    if (!result || typeof result.resolved !== 'boolean') return false;
+    results.set(targetKey(result), result.resolved);
+  }
+  if (batch.targets.some(target => !results.has(targetKey(target)))) return false;
+  const recovered = message.results.filter(result => result.resolved).length;
+  if (message.rows.length > recovered || !addRows(s, message, coverage.cutoff)) return false;
+  for (const target of batch.targets) {
+    if (results.get(targetKey(target)) || target.tries > 0) continue;
+    const { position, key } = target;
+    const tail = work.ranges.at(-1);
+    if (position !== undefined && !key && tail?.tries === 1 && !tail.key && tail.last + 1 === position) {
+      tail.last = position;
+    } else {
+      work.ranges.push({ ...(position === undefined ? {} : { first: position, last: position }),
+        ...(key ? { key } : {}), tries: 1 });
+    }
+  }
+  work.batch = null;
+  work.acknowledged = message.recoveryId;
+  coverage.skipped = Math.max(0, coverage.skipped - recovered);
+  coverage.scanned = (coverage.scanned ?? 0) + message.rows.length;
+  if (recovered) shiftLog.record(s, Date.now(), 'chat_list_reviewed', {
+    complete: true, partial: coverage.partial, scanned: coverage.scanned, total: coverage.total, skipped: coverage.skipped
+  });
+  return true;
+}
+
 async function planLogExport(s, now, actions, rollbacks) {
   const report = s.shiftLogs?.pending[0];
   let wake = shiftLog.nextBoundary(s, now);
@@ -321,7 +398,7 @@ async function planLogExport(s, now, actions, rollbacks) {
   if (report) wake = Math.min(wake, report.retryAt > now ? report.retryAt : now + MIN);
   const period = shiftLog.missingHour(s, now);
   if (Number.isFinite(period)) {
-    const logId = s.shiftLogs.active.id;
+    const logId = shiftLog.lookupId(s);
     const retry = s.journalRosterRetry;
     const delayed = retry?.logId === logId && retry.period === period && retry.at > now;
     if (delayed) wake = Math.min(wake, retry.at);
@@ -397,7 +474,7 @@ async function plan() {
       return actions;
     }
     if (!Number.isSafeInteger(s.tab)) {
-      await monitorTab(s, id => rollbacks.push(() => { void chrome.tabs.remove(id).catch(() => {}); }));
+      await monitorTab(s, id => rollbacks.push(() => removeCreatedMonitorTab(id)));
       return [async () => kick()];
     }
     const ref = { tab: s.tab, session: token(s), doc: s.doc };
@@ -503,7 +580,7 @@ async function plan() {
     timer = setTimeout(kick, Math.max(25, at - Date.now()));
     await planLogExport(s, now, actions, rollbacks);
     return actions;
-  }, () => { for (const release of rollbacks) release(); });
+  }, async () => { for (const release of rollbacks) await release(); });
   for (const run of tasks) void run().catch(failed);
 }
 
@@ -564,7 +641,7 @@ async function readJournalHour(request) {
     const moscow = clock.moscowHour(request.period);
     const roster = await ShSchedule.read(moscow.date, moscow.hour).catch(() => null);
     await tx(s => {
-      if (s.shiftLogs?.active?.id !== request.logId) return;
+      if (shiftLog.lookupId(s) !== request.logId) return;
       const now = Date.now();
       if (shiftLog.missingHour(s, now) !== request.period) return;
       const confirmed = roster && shiftLog.confirmHour(s, now, request.period, roster.names, roster.directory);
@@ -618,8 +695,9 @@ async function readChat(ref, job) {
       if (Date.now() >= expiresAt) return;
       history = await send(ref.tab, { type: 'monitor:read', session: ref.session,
         id: job.id, sinceAt: job.sinceAt, expiresAt, job }, ref.doc);
+      if (!history) history = { ready: false, reasonCode: 'tab_no_response' };
     }
-  } catch { history = { ready: false, reason: 'Вкладка не ответила на запрос истории.' }; }
+  } catch { history = { ready: false, reason: 'Вкладка не ответила на запрос истории.', reasonCode: 'tab_no_response' }; }
   finally {
     try {
       if (history) await tx(s => {
@@ -642,13 +720,14 @@ async function readChat(ref, job) {
           shiftLog.record(s, Date.now(), 'chat_checks_resumed', { previousReason: s.tabBlock.reason });
           s.tabBlock = null;
         }
-        const c = s.scan.chats[job.id];
-        const previousCheck = c?.checked;
-        for (const n of E.apply(s.scan, job, history, Date.now())) addNotice(s, { ...n, period: job.period });
-        if (c?.checked && c.checked !== previousCheck) {
+        const check = {};
+        for (const n of E.apply(s.scan, job, history, Date.now(), check)) addNotice(s, { ...n, period: job.period });
+        if (check.status) {
           s.checked = (s.checked || 0) + 1;
-          shiftLog.record(s, Date.now(), 'chat_checked', { status: c.status, pinned: job.pinned === true });
-        } else if (history.ready === false) shiftLog.record(s, Date.now(), 'chat_check_failed');
+          shiftLog.record(s, Date.now(), 'chat_checked', { status: check.status, pinned: job.pinned === true });
+        } else if (check.reasonCode) {
+          shiftLog.record(s, Date.now(), 'chat_check_failed', { reason: check.reasonCode });
+        }
       });
     } finally { if (runningRead === ref) runningRead = null; kick(); }
   }
@@ -786,20 +865,24 @@ async function tabMessage(m, sender) {
         s.pageIssue = '';
         if (s.connection.status === 'online') s.connection.onlineSeen = true;
         break;
+      case 'monitor:recovery-next':
+        return { ok: true, recovery: nextRecoveryBatch(s.coverage) };
       case 'monitor:coverage': {
-        const recovery = m.recovery === true;
-        if (!recovery && typeof m.complete !== 'boolean') return { ok: false };
-        const startupCutoff = recovery && s.coverage?.complete ? s.coverage.cutoff : s.scan.startupCutoff;
-        if (!Number.isFinite(startupCutoff) || (recovery && !s.coverage?.complete)) return { ok: true };
+        if (m.recovery === true) return { ok: applyRecoveryBatch(s, m) };
+        if (typeof m.complete !== 'boolean') return { ok: false };
+        const startupCutoff = s.scan.startupCutoff;
+        if (!Number.isFinite(startupCutoff)) return { ok: true };
+        const ranges = m.complete ? readRecoveryRanges(m.recoveryRanges ?? []) : null;
+        if (m.complete && !ranges) return { ok: false };
         const hasRows = Array.isArray(m.rows);
-        if ((m.complete || recovery) && !hasRows) return { ok: false };
+        if (m.complete && !hasRows) return { ok: false };
         if (hasRows) {
           if (!addRows(s, m, startupCutoff)) return { ok: false };
           s.ready = true;
           s.pageIssue = '';
           if (s.connection.status === 'online') s.connection.onlineSeen = true;
         }
-        if (!recovery && m.complete) {
+        if (m.complete) {
           rememberHead(s.scan, m);
           s.scan.startupCutoff = null;
           s.scan.baseline = true;
@@ -807,13 +890,14 @@ async function tabMessage(m, sender) {
           s.syncAt = Math.max(s.syncAt ?? 0, Date.now() + MIN);
         }
         const count = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
-        const complete = recovery || m.complete;
+        const complete = m.complete;
         const reason = !complete && typeof m.reason === 'string' ? m.reason.slice(0, 200) : '';
-        const skipped = count(m.skipped) ?? 0;
+        const trackedGaps = ranges?.reduce((total, range) => total + (range.first === undefined ? 1 : range.last - range.first + 1), 0);
+        const skipped = Math.max(count(m.skipped) ?? 0, trackedGaps ?? 0);
         s.coverage = {
           complete, cutoff: startupCutoff, partial: m.partial === true || skipped > 0,
-          scanned: recovery ? (s.coverage.scanned ?? 0) + m.rows.length : count(m.scanned),
-          total: recovery ? s.coverage.total : count(m.total), skipped, reason,
+          scanned: count(m.scanned), total: count(m.total), skipped, reason,
+          ...(complete ? { recovery: { ranges, batch: null, acknowledged: null } } : {}),
           retryAt: Number.isFinite(m.retryAt) ? m.retryAt : null
         };
         shiftLog.record(s, Date.now(), 'chat_list_reviewed', {
@@ -882,7 +966,7 @@ async function details(tabId) {
     const free = chats.filter(c => E.isFree(c, now)).map(c => ({
       id: c.id, title: c.title, version: E.freeVersion(c), ...waiting(c, now)
     })).sort((a, b) => (a.waitingSince ?? Infinity) - (b.waitingSince ?? Infinity) || a.title.localeCompare(b.title, 'ru'));
-    return { ...summary(s), canStart: Boolean(s.scan.curatorName), supportsFreeDismissal: true, rulesVersion: 7,
+    return { ...summary(s), canStart: Boolean(s.scan.curatorName), supportsFreeDismissal: true, rulesVersion: 8,
       attached: Number.isSafeInteger(s.lastWatchTab),
       here: monitoring(s) && tabId === s.tab, ready: monitoring(s) && s.ready, pinnedInstant: s.scan.pinnedImmediate !== false,
       scanComplete: s.coverage?.complete ?? null, scanStatus: coverageLabel(s), free,
@@ -1021,9 +1105,10 @@ async function popupMessage(m) {
     return { ok: true };
   }
   if (m.type === 'ui:start') {
+    let createdTab;
     const answer = await tx(async s => {
       if (!s.scan.curatorName) return { ok: false, error: curatorRequiredMessage };
-      const tab = await monitorTab(s);
+      const tab = await monitorTab(s, id => { createdTab = id; });
       if (!s.scan.enabled) {
         const now = Date.now();
         E.start(s.scan, now);
@@ -1033,7 +1118,7 @@ async function popupMessage(m) {
       }
       s.curatorSyncAt = Date.now() + 15_000;
       return { ok: true, tab, session: token(s), generation: s.scan.generation, curatorName: s.scan.curatorName };
-    });
+    }, () => createdTab === undefined ? undefined : removeCreatedMonitorTab(createdTab));
     if (!answer.ok) return answer;
     kick();
     // A newly created content document will also request the session with monitor:hello.

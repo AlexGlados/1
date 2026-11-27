@@ -95,7 +95,7 @@ function draw(s) {
   el('update-version').textContent = s?.update?.version ? 'Доступна версия ' + s.update.version : '';
   const local = clock.local();
   message('time-zone', 'Часовой пояс · ' + local.zoneLabel(Date.now()));
-  const currentWorker = s?.rulesVersion === 7;
+  const currentWorker = s?.rulesVersion === 8;
   const curatorRequired = currentWorker && s.curatorRequired === true;
   const canStart = s?.canStart ?? s?.attached;
   const status = !hasExtension ? 'Открой это меню через кнопку расширения в Chrome.'
