@@ -14,7 +14,7 @@ const tabBlockLabels = {
   loading: 'Жду загрузки вкладки проверки.',
   frozen: 'Chrome заморозил вкладку проверки. Открой её, затем вернись в рабочую вкладку.',
   discarded: 'Chrome выгрузил вкладку проверки. Открой её, затем вернись в рабочую вкладку.',
-  page: 'Верни вкладку проверки на страницу чатов Школково.',
+  page: 'Скрипт проверки доступен на странице чатов Школково.',
   missing: 'Жду доступную вкладку проверки.',
   list_scan: 'Обновляю начало списка чатов.'
 };
@@ -95,17 +95,20 @@ function draw(s) {
   el('update-version').textContent = s?.update?.version ? 'Доступна версия ' + s.update.version : '';
   const local = clock.local();
   message('time-zone', 'Часовой пояс · ' + local.zoneLabel(Date.now()));
-  const currentWorker = s?.rulesVersion === 6;
+  const currentWorker = s?.rulesVersion === 7;
   const curatorRequired = currentWorker && s.curatorRequired === true;
   const canStart = s?.canStart ?? s?.attached;
   const status = !hasExtension ? 'Открой это меню через кнопку расширения в Chrome.'
     : !s ? 'Не удалось получить состояние расширения.'
     : !currentWorker ? 'Chrome использует прежний фоновый скрипт. Перезагрузи расширение, чтобы применить изменения.'
     : curatorRequired ? 'Укажи имя и фамилию куратора, как в расписании.'
-    : s.active ? (s.ready ? 'Проверка запущена в отдельной вкладке' : 'Ожидаю загрузку списка чатов')
+    : s.active ? (s.tabBlock === 'page' ? 'Вкладка проверки недоступна'
+      : s.ready ? 'Проверка запущена в отдельной вкладке' : 'Ожидаю загрузку списка чатов')
     : canStart ? 'Проверка остановлена' : 'Открой страницу чатов. После установки обнови вкладку.';
   el('status').textContent = status;
   el('reload-extension').hidden = currentWorker || !hasExtension || typeof runtime.reload !== 'function';
+  el('return-to-chats').hidden = !currentWorker || !s?.active || s.tabBlock !== 'page';
+  el('return-to-chats').disabled = changing;
   el('curator-form').hidden = !curatorRequired;
   el('monitor-controls').hidden = curatorRequired;
   for (const id of ['curator-first-name', 'curator-last-name', 'save-curator']) el(id).disabled = changing || !curatorRequired;
@@ -178,6 +181,7 @@ el('test').addEventListener('click', () => command('ui:test'));
 el('finish').addEventListener('click', () => command('ui:finish'));
 el('shift-chats').addEventListener('click', () => command('ui:shift'));
 el('reload-extension').addEventListener('click', () => runtime.reload());
+el('return-to-chats').addEventListener('click', () => command('ui:return-to-chats'));
 el('senior').addEventListener('change', event => command('ui:settings', {
   mode: event.currentTarget.checked ? 'senior' : 'normal'
 }));

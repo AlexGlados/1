@@ -13,7 +13,8 @@
   const periodAt = now => calendarPeriodAt(now + 5 * MIN);
   const boundary = (now, s) => (s?.period ?? periodAt(now)) + 55 * MIN;
   const prefetchTime = (now, s) => boundary(now, s) - MIN;
-  const freshlyPrepared = (s, period) => s.prepared?.period === period && s.prepared.readAt >= period - 6 * MIN;
+  const freshlyPrepared = (s, period) => s.prepared?.period === period &&
+    Array.isArray(s.prepared.names) && s.prepared.readAt >= period - 6 * MIN;
   function inWindow(c, now) {
     return c.precision !== 'day' && recent(c.at, now);
   }
@@ -49,7 +50,7 @@
 
   function fresh() {
     return { enabled: false, generation: 0, baseline: false, rowsObservedAt: null, period: null,
-      roster: null, directory: [], appliedPeriod: null, prepared: null, calendarRoster: null,
+      roster: null, directory: [], appliedPeriod: null, appliedRosterKey: null, prepared: null, calendarRoster: null,
       prefetchError: '', prefetchRetryAt: 0, scheduleError: '', scheduleRetryAt: 0, scheduleReadAt: null,
       mode: 'normal', pinnedImmediate: true, curatorName: '', startedAt: null, startupCutoff: null, headThrough: null,
       coveragePending: false, handover: null, chats: {}, dismissedFree: {}, inactiveRows: {}, offDutyReviewQueued: true };
@@ -101,7 +102,7 @@
     }
   }
   function queueOffDutyReview(s, now) {
-    if (s.offDutyReviewQueued || !Array.isArray(s.roster) || !s.roster.length || s.appliedPeriod !== s.period) return;
+    if (s.offDutyReviewQueued || !Array.isArray(s.roster) || s.appliedPeriod !== s.period) return;
     s.offDutyReviewQueued = true;
     // Version 1.7.2 did not keep the reply author in ordinary chat records.
     // Read only recent, confirmed waits affected by the former two-hour rule.
@@ -130,8 +131,9 @@
       if (Math.max(removed.at, removed.rowAt) <= now - RECENT_MAX_AGE) delete s.inactiveRows[id];
     }
     for (const c of Object.values(s.chats)) {
-      if (tooOld(c.lastStudentAt, now) && tooOld(c.at, now) &&
-          (!Number.isFinite(c.lastMessageAt) || tooOld(c.lastMessageAt, now))) {
+      const lastActivity = Math.max(...[c.at, c.lastMessageAt, c.lastParticipantAt, c.lastStudentAt, c.lastReplyAt,
+        c.waitSince, c.binding?.replyAt, c.pinnedColleague?.replyAt].filter(Number.isFinite));
+      if (tooOld(lastActivity, now)) {
         delete s.chats[c.id];
         continue;
       }
@@ -188,7 +190,7 @@
     if (s.appliedPeriod == null && s.roster) s.appliedPeriod = previous;
     if (previous === calendar) {
       // The previous roster is still the calendar-hour schedule until :00.
-      s.calendarRoster = { period: previous, names: s.roster, readAt: s.scheduleReadAt,
+      s.calendarRoster = { period: previous, names: s.roster, directory: s.directory, readAt: s.scheduleReadAt,
         error: s.scheduleError, retryAt: s.scheduleRetryAt };
     }
     s.period = periodAt(now);
@@ -211,11 +213,11 @@
   function calendarSchedule(s, now) {
     const period = calendarPeriodAt(now);
     if (s.period === period) {
-      return { period, loaded: Boolean(s.roster?.length), readAt: s.scheduleReadAt ?? null,
+      return { period, loaded: Array.isArray(s.roster), readAt: s.scheduleReadAt ?? null,
         error: s.scheduleError || '', retryAt: s.scheduleRetryAt || 0 };
     }
     const cached = s.calendarRoster?.period === period ? s.calendarRoster : null;
-    return { period, loaded: Boolean(cached?.names?.length), readAt: cached?.readAt ?? null,
+    return { period, loaded: Array.isArray(cached?.names), readAt: cached?.readAt ?? null,
       error: cached?.error || '', retryAt: cached?.retryAt || 0 };
   }
   function scheduleTarget(s, now, skip = new Set()) {
@@ -233,20 +235,24 @@
     if (!c.checked && !c.binding && !c.transferAt) c.status = 'Новые чаты';
     const reason = c.pending?.reason === 'control' ? 'control' : 'activity';
     enqueue(c, now, reason, reset, urgent, startupCutoff);
+    if (Number.isFinite(startupCutoff)) c.startupQueuedCutoff = startupCutoff;
   }
   function activateRoster(s, data, now) {
     const transition = s.appliedPeriod !== s.period;
+    const rosterKey = data.names.map(normal).sort().join('\n');
+    const reconcile = transition || s.appliedRosterKey !== rosterKey;
     s.roster = data.names;
     s.directory = data.directory;
     s.appliedPeriod = s.period;
+    s.appliedRosterKey = rosterKey;
     s.scheduleReadAt = data.readAt;
     s.scheduleError = '';
     s.scheduleRetryAt = 0;
     if (!handoverAllowed(s, now)) s.handover = null;
-    const boundaryAt = s.period - 5 * MIN;
+    const releaseAt = transition ? s.period - 5 * MIN : now;
     for (const c of Object.values(s.chats)) {
       if (!c.binding && c.pinnedColleague) c.binding = { id: c.id, ...c.pinnedColleague };
-      if (c.binding && transition) {
+      if (c.binding && reconcile) {
         const name = s.roster.find(n => normal(n) === normal(c.binding.curator));
         if (name) {
           c.binding.curator = name;
@@ -257,7 +263,7 @@
         } else {
           c.transferReplyAt = c.lastReplyAt ?? c.binding.replyAt;
           c.binding = c.pinnedColleague = null;
-          c.transferReviewAt = inWindow(c, now) ? boundaryAt : null;
+          c.transferReviewAt = inWindow(c, now) ? releaseAt : null;
           c.transferReplyKey = c.lastReplyKey ?? null;
           c.transferAt = c.freeSince = null;
           c.status = c.transferReviewAt == null ? 'Ответ не требуется' : 'Ожидает проверки';
@@ -286,7 +292,7 @@
     const calendarOnly = !effective && ticket.period === calendarPeriodAt(now);
     const ahead = ticket.period === s.period + HOUR && now >= prefetchTime(now, s);
     if (!s.enabled || ticket.generation !== s.generation || !(effective || calendarOnly || ahead)) return false;
-    if (error || !Array.isArray(names) || !names.length || names.some(n => typeof n !== 'string' || !words(n).length)) {
+    if (error || !Array.isArray(names) || names.some(n => typeof n !== 'string' || !words(n).length)) {
       const why = 'Не удалось обновить расписание: ' + (error || 'на нужный час не удалось прочитать состав.');
       if (ahead && !freshlyPrepared(s, ticket.period)) {
         s.prefetchError = why;
@@ -307,7 +313,7 @@
       s.prefetchError = '';
       s.prefetchRetryAt = 0;
     } else if (calendarOnly) {
-      s.calendarRoster = { period: ticket.period, names: roster, readAt: now, error: '', retryAt: 0 };
+      s.calendarRoster = { ...data, error: '', retryAt: 0 };
     } else {
       activateRoster(s, data, now);
     }
@@ -339,9 +345,7 @@
     return aKey !== '' && aKey === key(b ?? '');
   }
   function handoverAllowed(s, now) {
-    if (s.appliedPeriod !== s.period || s.period !== periodAt(now) || !Array.isArray(s.roster)) return false;
-    const ownName = configuredCurator(s);
-    return s.roster.some(name => sameCurator(name, ownName));
+    return s.appliedPeriod === s.period && s.period === periodAt(now) && curatorDuty(s, s.roster, s.directory) === true;
   }
   function compatible(a, b) {
     const x = bare(a), y = bare(b);
@@ -374,10 +378,20 @@
   function knownCurators(s) {
     return [...(s.roster || []), ...(s.directory || [])];
   }
-  function configuredCurator(s) {
+  function configuredCuratorMatch(s, names) {
     // Prefer the same registered name. When the settings omit a patronymic,
     // both recorded name parts must identify exactly one directory entry.
-    return nameMatch(s.curatorName, knownCurators(s), (a, b) => bare(a) === bare(b)).name;
+    return nameMatch(s.curatorName, names, (a, b) => bare(a) === bare(b));
+  }
+  function configuredCurator(s) {
+    return configuredCuratorMatch(s, knownCurators(s)).name;
+  }
+  function curatorDuty(s, names, directory = []) {
+    if (!Array.isArray(names)) return null;
+    if (!names.length) return false;
+    const match = configuredCuratorMatch(s, [...names, ...(directory || [])]);
+    if (match.uncertain) return null;
+    return names.some(name => sameCurator(name, match.name));
   }
 
   function getChat(s, id) {
@@ -598,7 +612,8 @@
         admit(c, now, !c.pending, true);
       }
       const needsReview = !hasChecked(c) || (c.checked && !Object.hasOwn(c, 'waitSince'));
-      if (Number.isFinite(rowCutoff) && (!c.dismissedFree || changed || newlyUnread)) {
+      if (Number.isFinite(rowCutoff) && (c.startupQueuedCutoff !== rowCutoff || changed || newlyUnread) &&
+          (!c.dismissedFree || changed || newlyUnread)) {
         admit(c, now, false, unread, rowCutoff);
       } else if (!c.pending && needsReview && (c.binding || newOrUnread)) {
         admit(c, now, false, unread);
@@ -1082,7 +1097,7 @@
   }
 
   const api = { fresh, start, stop, finish, advance, prepareStartup, periodAt, calendarPeriodAt, calendarSchedule,
-    boundary, prefetchTime, scheduleTarget, installRoster,
+    boundary, prefetchTime, scheduleTarget, installRoster, curatorDuty,
     observe, reconcileRows, panelChanged, earliest, next, defer, apply, navigation,
     setMode, setPinnedInstant, dueNotices, nextNoticeAt, noticeEligible, setChatMute, unbind, isFree, freeVersion, dismissFree,
     waitingSince, isRecentChat: inWindow, isCheckableChat: inCheckWindow };

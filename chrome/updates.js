@@ -31,6 +31,16 @@
     return values[KEY] ?? {};
   }
 
+  async function readVersion() {
+    const response = await fetch(MANIFEST_URL, {
+      credentials: 'omit', cache: 'no-store', referrerPolicy: 'no-referrer', redirect: 'error',
+      signal: AbortSignal.timeout(10_000)
+    });
+    if (!response.ok) return null;
+    const { version } = await response.json();
+    return versionParts(version) ? version : null;
+  }
+
   async function checkDue(scheduled) {
     const previous = await read();
     const now = Date.now();
@@ -41,28 +51,25 @@
     const state = { ...previous, attemptedAt: now };
     await chrome.storage.local.set({ [KEY]: state });
 
-    const response = await fetch(MANIFEST_URL, {
-      credentials: 'omit', cache: 'no-store', referrerPolicy: 'no-referrer', redirect: 'error',
-      signal: AbortSignal.timeout(10_000)
-    });
-    if (!response.ok) return;
-    const data = await response.json();
-    const version = data?.version;
-    if (!versionParts(version)) return;
-
-    state.latestVersion = version;
+    const version = await readVersion().catch(() => null);
+    if (version !== null) state.latestVersion = version;
     const installed = chrome.runtime.getManifest().version;
-    const announce = newer(version, installed) &&
-      (!versionParts(state.announcedVersion) || newer(version, state.announcedVersion));
-    if (announce) state.announcedVersion = version;
-    // Persist the offer before attempting delivery so a worker restart cannot repeat it.
-    await chrome.storage.local.set({ [KEY]: state });
-    if (announce) {
-      await chrome.notifications.create(NOTICE_ID, {
-        type: 'basic', iconUrl: 'icon.png', title: 'Доступно обновление расширения Школково',
-        message: `Версия ${version} для Chrome. Нажми, чтобы открыть ветку обновления на GitHub.`
-      });
+    if (newer(state.latestVersion, installed) &&
+        (!versionParts(state.announcedVersion) || newer(state.latestVersion, state.announcedVersion))) {
+      state.pendingVersion = state.latestVersion;
+    } else {
+      delete state.pendingVersion;
     }
+    await chrome.storage.local.set({ [KEY]: state });
+    if (!state.pendingVersion) return;
+
+    await chrome.notifications.create(NOTICE_ID, {
+      type: 'basic', iconUrl: 'icon.png', title: 'Доступно обновление расширения Школково',
+      message: `Версия ${state.pendingVersion} для Chrome. Нажми, чтобы открыть ветку обновления на GitHub.`
+    });
+    state.announcedVersion = state.pendingVersion;
+    delete state.pendingVersion;
+    await chrome.storage.local.set({ [KEY]: state });
   }
 
   function check({ scheduled = false } = {}) {

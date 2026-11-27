@@ -207,7 +207,14 @@
     return row?.closest('[role="list"]') ?? null;
   }
 
-  function getListLayout(root, rows) {
+  function layoutRowKey(element) {
+    const rowId = idAttribute(element, 'data-chat-id') || idAttribute(element, 'data-conversation-id');
+    if (rowId) return 'id:' + rowId;
+    const header = /^[★☆]\s*(.+?)\s*\$(\d+)\b/u.exec(assignmentField(element, textOf(element)).clean);
+    return header ? `${header[2]}:${comparable(header[1])}` : null;
+  }
+
+  function getListLayout(root, rows, identifyUnknown = false) {
     const byElement = new Map(rows.map(row => [row.rowElement, row.key]));
     const positions = [];
     const sizes = new Set();
@@ -217,7 +224,8 @@
       const size = domPosition(element, 'aria-setsize');
       const top = /translateY\((-?[\d.]+)px\)/u.exec(element.style?.transform || element.getAttribute('style') || '');
       if (size) sizes.add(size);
-      positions.push({ position, key: byElement.get(element) ?? textOf(element), top: top ? Number(top[1]) : null });
+      const key = byElement.get(element) ?? (identifyUnknown ? layoutRowKey(element) : null);
+      positions.push({ position, key, top: top ? Number(top[1]) : null });
     }
     return { total: sizes.size === 1 ? [...sizes][0] : null, positions };
   }

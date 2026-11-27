@@ -8,6 +8,8 @@ const clock = globalThis.ShkolkovoTime;
 const updates = globalThis.ShkolkovoUpdates;
 const MIN = 60_000;
 const TAB_RETRY = 10_000;
+const PAGE_CHECK_INTERVAL = 30_000;
+const JOURNAL_RETRY = 5 * MIN;
 const TAB_BLOCKS = new Set(['in_use', 'draft', 'connection', 'loading', 'frozen', 'discarded', 'page', 'missing', 'list_scan']);
 const KEY = 'shkolkovo.monitor.v2';
 const BOOT = 'shkolkovo.browserSession';
@@ -30,7 +32,7 @@ const blankConnection = () => ({ status: 'unknown', episode: '', since: 0, alert
 function blank() {
   return { scan: E.fresh(), tab: null, lastWatchTab: null, boot: null, ownedTab: true, doc: null, ready: false, capturedHandoff: null,
     coverage: null, connection: blankConnection(), syncAt: 0, curatorSyncAt: null,
-    tabBlock: null, lastRecoveryAt: null,
+    tabBlock: null, lastRecoveryAt: null, pageIssue: '', pageCheckAt: 0, journalRosterRetry: null,
     outbox: {}, routes: {}, checked: 0, notified: 0, error: '', result: '' };
 }
 
@@ -55,11 +57,13 @@ function useCurator(s, name) {
   s.doc = null;
   s.ready = false;
   s.tabBlock = null;
+  s.pageIssue = '';
+  s.pageCheckAt = 0;
   s.connection = blankConnection();
   for (const notice of Object.values(s.outbox)) notice.session = token(s);
 }
 // All state and alarm writes have one owner. Network requests and DOM reads happen outside this lock.
-function tx(fn) {
+function tx(fn, rollback) {
   const action = writes.then(async () => {
     if (!db) {
       curatorFile ??= readCuratorFile();
@@ -68,6 +72,8 @@ function tx(fn) {
       if (!session[BOOT]) await chrome.storage.session.set({ [BOOT]: bootId });
       db = local[KEY] || blank();
       snapshot = JSON.stringify(db);
+    }
+    try {
       if (!Object.hasOwn(db.scan, 'startupCutoff')) {
         if (monitoring(db)) E.prepareStartup(db.scan, Date.now());
         else db.scan.startupCutoff = null;
@@ -75,11 +81,10 @@ function tx(fn) {
       }
       if (db.boot !== bootId || db.ownedTab !== true) {
         // Older versions could use the operator's tab. Tab IDs also expire when Chrome restarts.
-        Object.assign(db, { tab: null, lastWatchTab: null, doc: null, ready: false, coverage: null,
-          connection: blankConnection(), boot: bootId, ownedTab: true, routes: {}, tabBlock: null, lastRecoveryAt: null });
+        Object.assign(db, { tab: null, lastWatchTab: null, doc: null, ready: false,
+          connection: blankConnection(), boot: bootId, ownedTab: true, routes: {}, tabBlock: null,
+          lastRecoveryAt: null, pageIssue: '', pageCheckAt: 0 });
       }
-    }
-    try {
       const fileName = await curatorFile;
       if (fileName) useCurator(db, fileName);
       const now = Date.now();
@@ -96,6 +101,7 @@ function tx(fn) {
       return value;
     } catch (error) {
       db = JSON.parse(snapshot);
+      rollback?.();
       throw error;
     }
   });
@@ -108,7 +114,7 @@ function pause(s, reason) {
   if (Number.isInteger(s.tab)) s.lastWatchTab = s.tab;
   E.stop(s.scan);
   Object.assign(s, { tab: null, doc: null, ready: false, syncAt: 0, curatorSyncAt: null,
-    connection: blankConnection(), error: '', tabBlock: null });
+    connection: blankConnection(), error: '', tabBlock: null, pageIssue: '', pageCheckAt: 0 });
 }
 function loseMonitorTab(s, reason) {
   const now = Date.now();
@@ -117,13 +123,13 @@ function loseMonitorTab(s, reason) {
     s.result = 'Вкладка проверки закрылась. Запусти мониторинг, чтобы продолжить.';
   } else {
     shiftLog.record(s, now, 'monitor_tab_recovering', { reason });
-    Object.assign(s, { tab: null, doc: null, ready: false, coverage: null, tabBlock: null,
+    Object.assign(s, { tab: null, doc: null, ready: false, tabBlock: null, pageIssue: '', pageCheckAt: 0,
       connection: blankConnection(), lastRecoveryAt: now, syncAt: now + 2.5 * MIN, curatorSyncAt: now + 15_000 });
   }
   s.lastWatchTab = null;
 }
 
-async function monitorTab(s) {
+async function monitorTab(s, onCreate) {
   if (Number.isSafeInteger(s.tab)) return s.tab;
   let tab;
   if (s.boot === bootId && Number.isSafeInteger(s.lastWatchTab)) {
@@ -134,10 +140,13 @@ async function monitorTab(s) {
       if (!onMonitorPage) tab = null;
     }
   }
-  if (!tab) tab = await chrome.tabs.create({ url: chatUrl, active: false });
+  if (!tab) {
+    tab = await chrome.tabs.create({ url: chatUrl, active: false });
+    onCreate?.(tab.id);
+  }
   if (tab.autoDiscardable !== false) await chrome.tabs.update(tab.id, { autoDiscardable: false }).catch(() => {});
   Object.assign(s, { tab: tab.id, lastWatchTab: tab.id, boot: bootId, doc: null, ready: false,
-    coverage: null, connection: blankConnection(), tabBlock: null });
+    connection: blankConnection(), tabBlock: null, pageIssue: '', pageCheckAt: 0 });
   for (const notice of Object.values(s.outbox)) notice.tab = tab.id;
   for (const route of Object.values(s.routes)) {
     if (route.boot === bootId) route.tab = tab.id;
@@ -250,10 +259,12 @@ let queued = false;
 let runningRead;
 let runningSync;
 let runningProbe;
+let runningPageCheck;
 let handoffCapture;
 let captureRetryAt = 0;
 let runningDelivery;
 let runningLogExport = false;
+let journalLookup;
 const fetching = new Map(); // target roster hour -> shift generation
 let retryWake = 0;
 function kick() {
@@ -281,16 +292,18 @@ async function alarm(name, when) {
 function eligible(s, n) {
   if (!monitoring(s) || n.tab !== s.tab || n.session !== token(s)) return false;
   if (n.kind === 'offline' || n.kind === 'connecting') {
-    return Boolean(s.doc && n.doc === s.doc && n.kind === s.connection.status && n.since === s.connection.since);
+    const c = s.connection;
+    const sameEpisode = n.kind === c.status || (n.kind === 'offline' && c.status === 'unknown' && c.episode === 'offline');
+    return Boolean(s.doc && n.doc === s.doc && sameEpisode && n.since === c.since);
   }
   return E.noticeEligible(s.scan, n, Date.now());
 }
 
-function addRows(s, result) {
-  if (Number.isFinite(s.scan.startupCutoff)) return true;
-  if (!Number.isFinite(result.observedAt) ||
-      !E.observe(s.scan, result.rows, Date.now(), result.observedAt, { partial: true })) return false;
-  rememberHead(s.scan, result);
+function addRows(s, result, startupCutoff = s.scan.startupCutoff) {
+  const startup = Number.isFinite(startupCutoff);
+  if (!Number.isFinite(result.observedAt) || !E.observe(s.scan, result.rows, Date.now(), result.observedAt,
+    { partial: true, ...(startup ? { startupCutoff } : {}) })) return false;
+  if (!startup) rememberHead(s.scan, result);
   return true;
 }
 
@@ -301,11 +314,25 @@ function rememberHead(scan, result) {
   }
 }
 
-async function planLogExport(s, now, actions) {
+async function planLogExport(s, now, actions, rollbacks) {
   const report = s.shiftLogs?.pending[0];
   let wake = shiftLog.nextBoundary(s, now);
   const ready = report && !runningLogExport && report.retryAt <= now;
   if (report) wake = Math.min(wake, report.retryAt > now ? report.retryAt : now + MIN);
+  const period = shiftLog.missingHour(s, now);
+  if (Number.isFinite(period)) {
+    const logId = s.shiftLogs.active.id;
+    const retry = s.journalRosterRetry;
+    const delayed = retry?.logId === logId && retry.period === period && retry.at > now;
+    if (delayed) wake = Math.min(wake, retry.at);
+    else if (!journalLookup) {
+      const request = { logId, period };
+      journalLookup = request;
+      rollbacks.push(() => { if (journalLookup === request) journalLookup = null; });
+      actions.push(() => readJournalHour(request));
+      wake = Math.min(wake, now + MIN);
+    }
+  }
   await alarm(LOG_ALARM, wake);
   if (ready) actions.push(() => exportShiftLog(report));
 }
@@ -314,7 +341,7 @@ async function exportShiftLog(report) {
   if (runningLogExport) return;
   runningLogExport = true;
   try {
-    const filename = shiftLog.filename(report);
+    let filename = shiftLog.filename(report);
     let where;
     let downloadId = report.downloadId;
     const retryAt = Date.now() + MIN;
@@ -324,7 +351,7 @@ async function exportShiftLog(report) {
       if (written) where = 'folder';
       else {
         downloadId = await chrome.downloads.download({
-          url: 'data:text/plain;charset=utf-8,' + encodeURIComponent(text),
+          url: 'data:application/octet-stream,' + encodeURIComponent(text),
           filename: 'logs/' + filename, conflictAction: 'overwrite', saveAs: false
         }).catch(() => null);
       }
@@ -333,7 +360,10 @@ async function exportShiftLog(report) {
       const downloads = await chrome.downloads.search({ id: downloadId }).catch(() => null);
       if (downloads) {
         const [download] = downloads;
-        if (download?.state === 'complete') where = 'downloads';
+        if (download?.state === 'complete') {
+          where = 'downloads';
+          if (typeof download.filename === 'string') filename = download.filename.split(/[\\/]/u).at(-1) || filename;
+        }
         else if (!download || download.state === 'interrupted') downloadId = null;
       }
     }
@@ -356,19 +386,24 @@ async function exportShiftLog(report) {
 }
 
 async function plan() {
+  const rollbacks = [];
   const tasks = await tx(async s => {
     clearTimeout(timer);
     const now = Date.now();
     const actions = [];
     if (!monitoring(s)) {
       await Promise.all([HOUR_ALARM, PREFETCH_ALARM, TASK_ALARM].map(name => alarm(name, Infinity)));
-      await planLogExport(s, now, actions);
+      await planLogExport(s, now, actions, rollbacks);
       return actions;
     }
-    if (!Number.isSafeInteger(s.tab)) await monitorTab(s);
+    if (!Number.isSafeInteger(s.tab)) {
+      await monitorTab(s, id => rollbacks.push(() => { void chrome.tabs.remove(id).catch(() => {}); }));
+      return [async () => kick()];
+    }
     const ref = { tab: s.tab, session: token(s), doc: s.doc };
     if (runningRead && !current(s, runningRead)) runningRead = null;
     if (runningProbe && !current(s, runningProbe)) runningProbe = null;
+    if (runningPageCheck && !current(s, runningPageCheck)) runningPageCheck = null;
     if (handoffCapture && !current(s, handoffCapture)) {
       handoffCapture.done.resolve();
       handoffCapture = null;
@@ -393,6 +428,10 @@ async function plan() {
       if (now >= captureRetryAt) {
         const request = { ...ref, handoffAt, done: Promise.withResolvers() };
         handoffCapture = request;
+        rollbacks.push(() => {
+          request.done.resolve();
+          if (handoffCapture === request) handoffCapture = null;
+        });
         actions.push(() => captureRows(request));
       } else times.push(captureRetryAt);
     }
@@ -403,6 +442,7 @@ async function plan() {
          Number.isFinite(period) && !inFlight.has(period); period = E.scheduleTarget(s.scan, now, inFlight)) {
       const target = period;
       fetching.set(target, generation);
+      rollbacks.push(() => { if (fetching.get(target) === generation) fetching.delete(target); });
       inFlight.add(target);
       actions.push(() => readSchedule(generation, target));
     }
@@ -418,12 +458,14 @@ async function plan() {
       if (item.retryAt > now) { times.push(item.retryAt); continue; }
       if (!runningDelivery) {
         runningDelivery = id;
+        rollbacks.push(() => { if (runningDelivery === id) runningDelivery = null; });
         actions.push(() => deliver(id));
       }
     }
     if (runningRead && current(s, runningRead) && s.syncAt <= now) s.syncAt = now + MIN;
     if (!startupPending && s.doc && !runningSync && !runningRead && !handoffCapture && s.syncAt <= now) {
       runningSync = ref;
+      rollbacks.push(() => { if (runningSync === ref) runningSync = null; });
       actions.push(() => sync(ref));
     }
     if (s.syncAt > now) times.push(s.syncAt);
@@ -433,14 +475,23 @@ async function plan() {
       if (now >= due) {
         const probeRef = { ...ref, status: c.status, since: c.since };
         runningProbe = probeRef;
+        rollbacks.push(() => { if (runningProbe === probeRef) runningProbe = null; });
         actions.push(() => probe(probeRef));
       } else times.push(due);
     }
+    if (!runningPageCheck && (s.pageCheckAt ?? 0) <= now) {
+      runningPageCheck = ref;
+      rollbacks.push(() => { if (runningPageCheck === ref) runningPageCheck = null; });
+      s.pageCheckAt = now + PAGE_CHECK_INTERVAL;
+      actions.push(() => checkMonitorPage(ref));
+    }
+    if (s.pageCheckAt > now) times.push(s.pageCheckAt);
     if (s.tabBlock?.retryAt > now) times.push(s.tabBlock.retryAt);
-    else if (!startupPending && s.ready && s.doc && !runningSync && !runningRead && !handoffCapture) {
+    else if (s.ready && s.doc && !runningSync && !runningRead && !handoffCapture) {
       const job = E.next(s.scan, now);
       if (job) {
         runningRead = ref;
+        rollbacks.push(() => { if (runningRead === ref) runningRead = null; });
         actions.push(() => readChat(ref, job));
       } else {
         const when = E.earliest(s.scan, now);
@@ -450,9 +501,9 @@ async function plan() {
     const at = Math.min(...times);
     await alarm(TASK_ALARM, at);
     timer = setTimeout(kick, Math.max(25, at - Date.now()));
-    await planLogExport(s, now, actions);
+    await planLogExport(s, now, actions, rollbacks);
     return actions;
-  });
+  }, () => { for (const release of rollbacks) release(); });
   for (const run of tasks) void run().catch(failed);
 }
 
@@ -500,7 +551,6 @@ async function readSchedule(generation, period) {
           hourMsk: `${moscow.date}T${moscow.time}:00${moscow.offset}`,
           ...(result && { rosterSize: result.names.length })
         });
-        if (result?.names.length === 0) shiftLog.observe(s, now, true, { period, names: result.names });
       }
     });
   } finally {
@@ -508,6 +558,49 @@ async function readSchedule(generation, period) {
     kick();
   }
 }
+
+async function readJournalHour(request) {
+  try {
+    const moscow = clock.moscowHour(request.period);
+    const roster = await ShSchedule.read(moscow.date, moscow.hour).catch(() => null);
+    await tx(s => {
+      if (s.shiftLogs?.active?.id !== request.logId) return;
+      const now = Date.now();
+      if (shiftLog.missingHour(s, now) !== request.period) return;
+      const confirmed = roster && shiftLog.confirmHour(s, now, request.period, roster.names, roster.directory);
+      s.journalRosterRetry = confirmed ? null : { ...request, at: now + JOURNAL_RETRY };
+    });
+  } finally {
+    if (journalLookup === request) journalLookup = null;
+    kick();
+  }
+}
+
+async function checkMonitorPage(ref) {
+  try {
+    const tab = await chrome.tabs.get(ref.tab).catch(() => null);
+    let issue;
+    if (!tab) issue = 'missing';
+    else if (tab.discarded) issue = 'discarded';
+    else if (tab.frozen) issue = 'frozen';
+    else if (tab.status === 'loading') issue = 'loading';
+    else if ((tab.pendingUrl || tab.url) && !onChat(tab.pendingUrl || tab.url)) issue = 'page';
+    else issue = (await send(ref.tab, { type: 'monitor:ping' }).catch(() => null))?.ok ? '' : 'page';
+    await tx(s => {
+      if (!current(s, ref)) return;
+      s.pageIssue = issue;
+      if (issue === 'page' || issue === 'missing') {
+        Object.assign(s, { doc: null, ready: false, tabBlock: null, connection: blankConnection() });
+      } else if (!issue && !s.doc) {
+        s.curatorSyncAt ??= Date.now();
+      }
+    });
+  } finally {
+    if (runningPageCheck === ref) runningPageCheck = null;
+    kick();
+  }
+}
+
 async function readChat(ref, job) {
   let history;
   try {
@@ -635,13 +728,16 @@ async function deliver(id) {
         if (!Object.hasOwn(existing, id)) {
           if (n.kind === 'offline') {
             const tab = await chrome.tabs.get(n.tab).catch(() => null);
-            if (!tab || tab.status === 'loading') {
+            const snapshot = tab && tab.status !== 'loading'
+              ? await send(n.tab, { type: 'monitor:snapshot', session: n.session }, n.doc).catch(() => null) : null;
+            const status = snapshot?.connection;
+            if (status === 'online' || status === 'connecting') {
+              connection(s, status);
               removeNotice(s, id);
               return;
             }
-            const snapshot = await send(n.tab, { type: 'monitor:snapshot', session: n.session }, n.doc);
-            if (snapshot?.connection !== 'offline') {
-              removeNotice(s, id);
+            if (status !== 'offline') {
+              n.retryAt = Date.now() + 5000;
               return;
             }
           }
@@ -665,7 +761,9 @@ async function deliver(id) {
 }
 
 async function tabMessage(m, sender) {
-  if (m.type === 'monitor:rows') await pendingHandoffRows(sender.tab.id, sender.documentId, m.session);
+  if (m.type === 'monitor:rows' || (m.type === 'monitor:coverage' && Array.isArray(m.rows))) {
+    await pendingHandoffRows(sender.tab.id, sender.documentId, m.session);
+  }
   const result = await tx(s => {
     if (m.type === 'monitor:hello') {
       if (!monitoring(s) || s.tab !== sender.tab.id) return { session: null, generation: s.scan.generation };
@@ -675,6 +773,7 @@ async function tabMessage(m, sender) {
         s.connection = blankConnection();
         s.tabBlock = null;
       }
+      s.pageIssue = '';
       return { session: token(s), generation: s.scan.generation, curatorName: s.scan.curatorName,
         startupCutoff: s.scan.startupCutoff, headThrough: s.scan.headThrough ?? null };
     }
@@ -684,34 +783,41 @@ async function tabMessage(m, sender) {
       case 'monitor:rows':
         if (!Array.isArray(m.rows) || !addRows(s, m)) return { ok: false };
         s.ready = true;
+        s.pageIssue = '';
         if (s.connection.status === 'online') s.connection.onlineSeen = true;
         break;
       case 'monitor:coverage': {
-        if (typeof m.complete !== 'boolean') return { ok: false };
-        const startupCutoff = s.scan.startupCutoff;
-        if (!Number.isFinite(startupCutoff)) return { ok: true };
-        if (m.complete) {
-          const now = Date.now();
-          if (!Array.isArray(m.rows) || !Number.isFinite(m.observedAt) ||
-              !E.observe(s.scan, m.rows, now, m.observedAt, { partial: true, startupCutoff })) {
-            return { ok: false };
-          }
+        const recovery = m.recovery === true;
+        if (!recovery && typeof m.complete !== 'boolean') return { ok: false };
+        const startupCutoff = recovery && s.coverage?.complete ? s.coverage.cutoff : s.scan.startupCutoff;
+        if (!Number.isFinite(startupCutoff) || (recovery && !s.coverage?.complete)) return { ok: true };
+        const hasRows = Array.isArray(m.rows);
+        if ((m.complete || recovery) && !hasRows) return { ok: false };
+        if (hasRows) {
+          if (!addRows(s, m, startupCutoff)) return { ok: false };
+          s.ready = true;
+          s.pageIssue = '';
+          if (s.connection.status === 'online') s.connection.onlineSeen = true;
+        }
+        if (!recovery && m.complete) {
           rememberHead(s.scan, m);
           s.scan.startupCutoff = null;
           s.scan.baseline = true;
           s.scan.coveragePending = false;
-          s.ready = true;
-          s.syncAt = Math.max(s.syncAt ?? 0, now + MIN);
-          if (s.connection.status === 'online') s.connection.onlineSeen = true;
+          s.syncAt = Math.max(s.syncAt ?? 0, Date.now() + MIN);
         }
         const count = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
-        const reason = !m.complete && typeof m.reason === 'string' ? m.reason.slice(0, 200) : '';
+        const complete = recovery || m.complete;
+        const reason = !complete && typeof m.reason === 'string' ? m.reason.slice(0, 200) : '';
+        const skipped = count(m.skipped) ?? 0;
         s.coverage = {
-          complete: m.complete, partial: m.partial === true, scanned: count(m.scanned), total: count(m.total), reason,
+          complete, cutoff: startupCutoff, partial: m.partial === true || skipped > 0,
+          scanned: recovery ? (s.coverage.scanned ?? 0) + m.rows.length : count(m.scanned),
+          total: recovery ? s.coverage.total : count(m.total), skipped, reason,
           retryAt: Number.isFinite(m.retryAt) ? m.retryAt : null
         };
         shiftLog.record(s, Date.now(), 'chat_list_reviewed', {
-          complete: s.coverage.complete, partial: s.coverage.partial, scanned: s.coverage.scanned, total: s.coverage.total
+          complete, partial: s.coverage.partial, scanned: s.coverage.scanned, total: s.coverage.total, skipped
         });
         break;
       }
@@ -756,9 +862,10 @@ function summary(s) {
 function coverageLabel(s) {
   if (!monitoring(s)) return '';
   if (!s.coverage) return Number.isFinite(s.scan.startupCutoff) ? 'Начальный просмотр чатов за 45 минут.' : '';
-  const { complete, reason, retryAt } = s.coverage;
-  if (complete) return 'Начальный просмотр чатов за 45 минут завершён.';
-  return ['Начальный просмотр чатов за 45 минут ещё идёт.', reason,
+  const { complete, reason, retryAt, skipped } = s.coverage;
+  const missing = skipped ? 'Строк без подтверждённого времени — ' + skipped + '.' : '';
+  if (complete) return ['Начальный просмотр чатов за 45 минут завершён.', missing].filter(Boolean).join(' ');
+  return ['Начальный просмотр чатов за 45 минут ещё идёт.', missing, reason,
     retryAt > Date.now() ? 'Повтор в ' + timeLabel(retryAt) + '.' : 'Проверка продолжится.'].filter(Boolean).join(' ');
 }
 function waiting(c, now) {
@@ -775,7 +882,7 @@ async function details(tabId) {
     const free = chats.filter(c => E.isFree(c, now)).map(c => ({
       id: c.id, title: c.title, version: E.freeVersion(c), ...waiting(c, now)
     })).sort((a, b) => (a.waitingSince ?? Infinity) - (b.waitingSince ?? Infinity) || a.title.localeCompare(b.title, 'ru'));
-    return { ...summary(s), canStart: Boolean(s.scan.curatorName), supportsFreeDismissal: true, rulesVersion: 6,
+    return { ...summary(s), canStart: Boolean(s.scan.curatorName), supportsFreeDismissal: true, rulesVersion: 7,
       attached: Number.isSafeInteger(s.lastWatchTab),
       here: monitoring(s) && tabId === s.tab, ready: monitoring(s) && s.ready, pinnedInstant: s.scan.pinnedImmediate !== false,
       scanComplete: s.coverage?.complete ?? null, scanStatus: coverageLabel(s), free,
@@ -783,7 +890,7 @@ async function details(tabId) {
       checked: s.checked || 0, notified: s.notified || 0,
       pending: checkable.filter(c => c.pending).length, uncertain: uncertain.length,
       reason: failedChat ? `Не удалось проверить «${failedChat.title}». ${failedChat.reason}` : '',
-      connection: s.connection.status, tabBlock: s.tabBlock?.retryAt > now ? s.tabBlock.reason : '',
+      connection: s.connection.status, tabBlock: s.pageIssue || (s.tabBlock?.retryAt > now ? s.tabBlock.reason : ''),
       error: s.error };
   });
   kick();
@@ -883,6 +990,19 @@ async function popupMessage(m) {
     return answer;
   }
   if (m.type === 'ui:shift') return showShift();
+  if (m.type === 'ui:return-to-chats') {
+    const result = await tx(async s => {
+      if (!monitoring(s) || !Number.isInteger(s.tab) || s.pageIssue !== 'page') {
+        return { ok: false, error: 'Вкладка проверки уже изменилась.' };
+      }
+      await chrome.tabs.update(s.tab, { url: chatUrl });
+      Object.assign(s, { ready: false, doc: null, connection: blankConnection(), tabBlock: null,
+        pageIssue: 'loading', pageCheckAt: 0, curatorSyncAt: Date.now() });
+      return { ok: true };
+    });
+    kick();
+    return result;
+  }
   if (m.type === 'ui:dismiss-free') {
     if (typeof m.id !== 'string' || typeof m.version !== 'string') return { ok: false };
     return dismissFree(m.id, m.version);
@@ -988,14 +1108,16 @@ chrome.tabs.onRemoved.addListener((id, info) => {
   }).then(kick, failed);
 });
 chrome.tabs.onUpdated.addListener((id, change) => {
-  if (change.status !== 'loading' && change.frozen !== false && change.discarded !== false) return;
+  if (!change.status && !change.url && change.frozen === undefined && change.discarded === undefined) return;
   void tx(s => {
     if (s.tab !== id) return false;
-    if (change.status === 'loading') {
-      Object.assign(s, { ready: false, doc: null, connection: blankConnection(), tabBlock: null });
+    if (change.status === 'loading' || (change.url && !onChat(change.url))) {
+      Object.assign(s, { ready: false, doc: null, connection: blankConnection(), tabBlock: null,
+        pageIssue: change.status === 'loading' ? 'loading' : 'page', pageCheckAt: 0 });
     } else if (s.tabBlock && ['discarded', 'frozen'].includes(s.tabBlock.reason)) {
       s.tabBlock.retryAt = 0;
     }
+    if (change.status === 'complete' || change.url || change.frozen !== undefined || change.discarded !== undefined) s.pageCheckAt = 0;
     return true;
   }).then(changed => { if (changed) kick(); }, failed);
 });
