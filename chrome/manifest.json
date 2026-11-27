@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Школково — свободные чаты",
-  "version": "1.10.3",
+  "version": "1.10.4",
   "minimum_chrome_version": "120",
   "description": "Уведомления о свободных и закреплённых чатах с учётом действующего дежурства по Москве.",
   "permissions": ["notifications", "storage", "alarms", "downloads"],
-  "host_permissions": ["https://docs.google.com/*"],
+  "host_permissions": ["https://docs.google.com/*", "https://raw.githubusercontent.com/*"],
   "background": { "service_worker": "background.js" },
   "icons": { "128": "icon.png" },
   "action": {

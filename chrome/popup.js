@@ -91,6 +91,8 @@ function drawFreeList(local, free = []) {
 }
 function draw(s) {
   state = s;
+  el('update-offer').hidden = !s?.update?.version;
+  el('update-version').textContent = s?.update?.version ? 'Доступна версия ' + s.update.version : '';
   const local = clock.local();
   message('time-zone', 'Часовой пояс · ' + local.zoneLabel(Date.now()));
   const currentWorker = s?.rulesVersion === 6;

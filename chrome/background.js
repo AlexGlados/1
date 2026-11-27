@@ -1,10 +1,11 @@
 'use strict';
-importScripts('identity.js', 'engine.js', 'schedule.js', 'time.js', 'shift-log.js', 'log-folder.js');
+importScripts('identity.js', 'engine.js', 'schedule.js', 'time.js', 'shift-log.js', 'log-folder.js', 'updates.js');
 
 const E = globalThis.ChatEngine;
 const identity = globalThis.ShkolkovoIdentity;
 const shiftLog = globalThis.ShkolkovoShiftLog;
 const clock = globalThis.ShkolkovoTime;
+const updates = globalThis.ShkolkovoUpdates;
 const MIN = 60_000;
 const TAB_RETRY = 10_000;
 const TAB_BLOCKS = new Set(['in_use', 'draft', 'connection', 'loading', 'frozen', 'discarded', 'page', 'missing', 'list_scan']);
@@ -19,6 +20,7 @@ const chatOrigin = new URL(chatUrl).origin;
 const popupUrl = chrome.runtime.getURL('popup.html');
 const shiftUrl = chrome.runtime.getURL('shift.html');
 const logSettingsUrl = chrome.runtime.getURL('log-settings.html');
+const updateGuideUrl = 'https://github.com/AlexGlados/1/tree/chrome#обновить-расширение';
 const timeLabel = value => clock.local().label(value);
 const token = state => String(state.scan.generation);
 const monitoring = state => state.scan.enabled && Boolean(state.scan.curatorName);
@@ -863,7 +865,10 @@ async function popupMessage(m) {
     await chrome.notifications.create('shkolkovo-test', notification('Школково — тест', timeLabel(Date.now())));
     return { ok: true };
   }
-  if (m.type === 'ui:status') return details(m.tabId);
+  if (m.type === 'ui:status') {
+    const [state, update] = await Promise.all([details(m.tabId), updates.status().catch(() => null)]);
+    return { ...state, update };
+  }
   if (m.type === 'ui:set-curator') {
     const name = identity.parse(m);
     if (!name) return { ok: false, error: 'Проверь имя и фамилию куратора.' };
@@ -963,7 +968,10 @@ chrome.runtime.onMessage.addListener((m, sender, respond) => {
   action.then(respond, () => respond({ ok: false, error: 'Chrome не смог выполнить действие. Проверь доступ и уведомления расширения.' }));
   return true;
 });
-chrome.alarms.onAlarm.addListener(a => { if ([HOUR_ALARM, PREFETCH_ALARM, TASK_ALARM, LOG_ALARM].includes(a.name)) kick(); });
+chrome.alarms.onAlarm.addListener(a => {
+  if (a.name === updates.ALARM) void updates.check({ scheduled: true });
+  else if ([HOUR_ALARM, PREFETCH_ALARM, TASK_ALARM, LOG_ALARM].includes(a.name)) kick();
+});
 chrome.downloads.onChanged.addListener(change => {
   if (!['complete', 'interrupted'].includes(change.state?.current)) return;
   void tx(s => {
@@ -993,6 +1001,10 @@ chrome.tabs.onUpdated.addListener((id, change) => {
 });
 chrome.notifications.onClosed.addListener(id => { void tx(s => { delete s.routes[id]; }).catch(failed); });
 chrome.notifications.onClicked.addListener(id => {
+  if (id === updates.NOTICE_ID) {
+    void chrome.tabs.create({ url: updateGuideUrl }).then(() => chrome.notifications.clear(id)).catch(() => {});
+    return;
+  }
   void (async () => {
     const target = await tx(s => {
       const route = s.routes[id];
@@ -1019,5 +1031,9 @@ chrome.runtime.onInstalled.addListener(() => {
     chrome.alarms.clear('shkolkovo-watch-sync')
   ]).then(kick, failed);
 });
-chrome.runtime.onStartup.addListener(kick);
+chrome.runtime.onStartup.addListener(() => {
+  kick();
+  void updates.initialize().catch(() => {});
+});
 kick();
+void updates.initialize().catch(() => {});
