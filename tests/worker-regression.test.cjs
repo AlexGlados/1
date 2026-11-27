@@ -149,6 +149,7 @@ function fixture() {
     plan: () => vm.runInContext('plan()', context),
     popup: type => dispatch({ url: ORIGIN + 'popup.html' }, { type }),
     report: fields => fromContent('monitor:coverage', fields),
+    startupBlock: reason => fromContent('monitor:startup-block', { reason }),
     wake: fields => fromContent('monitor:wake', fields),
     recovery: () => fromContent('monitor:recovery-next'),
     async reload() {
@@ -326,6 +327,61 @@ test('a rejected ready history logs a reason code without the chat or message me
   assert.equal(f.saved().checked, 0);
 });
 
+test('a minute overlapping the startup cutoff is retried while exact history is decided precisely', async () => {
+  const at = START - 45 * MINUTE;
+  const cutoff = at + 30_000;
+  for (const [time, precision, checked, failure, earlierAt] of [
+    [at, 'minute', 0, 'message_time_unconfirmed'],
+    [cutoff, 'exact', 0, undefined],
+    [cutoff + 1, 'exact', 1, undefined],
+    [at, 'minute', 0, 'message_time_unconfirmed', cutoff - 1],
+    [at, 'minute', 1, undefined, cutoff + 1]
+  ]) {
+    const f = fixture();
+    f.state.scan.startupCutoff = cutoff;
+    f.controls.read = ({ id }) => ({ id, identity: '1__2__3', ready: true, startReached: true, complete: true,
+      messages: [
+        ...(Number.isFinite(earlierAt) ? [{ id: 'earlier', at: earlierAt, precision: 'exact', role: 'service' }] : []),
+        { id: 'tail', at: time, precision, role: 'student', author: 'Fixture' }
+      ] });
+    await f.report({ complete: true, partial: true, recoveryRanges: [],
+      rows: [{ id: 'id:1__2__3', title: 'Fixture', at, precision: 'minute' }] });
+    await f.plan();
+    await settle();
+
+    const saved = f.saved();
+    assert.equal(saved.checked, checked);
+    assert.equal(saved.shiftLogs.active.events.find(event => event.event === 'chat_check_failed')?.details.reason, failure);
+    assert.equal(Boolean(saved.scan.chats['id:1__2__3'].pending), Boolean(failure));
+  }
+});
+
+test('startup block is visible before rows are ready and logs only transitions', async () => {
+  const f = fixture();
+  f.state.scan.startupCutoff = START - 45 * MINUTE;
+  f.state.ready = false;
+  f.state.pageCheckAt = 0;
+  await f.startupBlock('in_use');
+  await f.plan();
+  await settle();
+  const waiting = await f.popup('ui:status');
+  assert.equal(waiting.ready, false);
+  assert.equal(waiting.scanComplete, null);
+  assert.equal(waiting.tabBlock, 'in_use');
+  await f.startupBlock('in_use');
+  await f.startupBlock('draft');
+  assert.equal((await f.popup('ui:status')).tabBlock, 'draft');
+  await f.startupBlock('');
+  assert.equal((await f.popup('ui:status')).tabBlock, '');
+  assert.deepEqual(f.saved().shiftLogs.active.events.filter(event => event.event.startsWith('chat_list_'))
+    .map(event => [event.event, event.details.reason ?? event.details.previousReason]),
+  [['chat_list_deferred', 'in_use'], ['chat_list_deferred', 'draft'], ['chat_list_resumed', 'draft']]);
+
+  await f.report({ complete: true, rows: [], recoveryRanges: [] });
+  await f.startupBlock('in_use');
+  assert.equal((await f.popup('ui:status')).tabBlock, '');
+});
+
 test('stopping the targeted search at the time boundary has a distinct journal code', async () => {
   const f = fixture();
   f.state.scan.startupCutoff = START - 45 * MINUTE;
@@ -412,6 +468,29 @@ test('a schedule failure records the fixed cause without the underlying error de
   const failure = f.saved().shiftLogs.active.events.find(event => event.event === 'schedule_failed');
   assert.equal(failure.details.reason, 'schedule_config');
   assert.deepEqual(Object.keys(failure.details).sort(), ['hourMsk', 'reason']);
+});
+
+test('the journal waits for a first confirmed duty hour even across a schedule retry', async () => {
+  const f = fixture();
+  f.state.scan.roster = null;
+  const requests = [];
+  f.controls.schedule = async (date, hour) => {
+    requests.push([date, hour]);
+    throw Object.assign(new Error('Schedule timed out'), { code: 'schedule_timeout' });
+  };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await f.plan();
+    await settle();
+    assert.equal(f.saved().shiftLogs.active.lastDutyPeriod, null);
+    f.advance(5 * MINUTE);
+  }
+  assert.deepEqual(requests, [['2026-11-27', 13], ['2026-11-27', 13]]);
+  assert.equal(f.saved().shiftLogs.active.events.some(event => event.details?.scope === 'journal'), false);
+
+  f.controls.schedule = async () => ({ names: ['Иван Петров'], directory: ['Иван Петров'] });
+  await f.plan();
+  await settle();
+  assert.equal(f.saved().shiftLogs.active.lastDutyPeriod, Date.UTC(2026, 10, 27, 10));
 });
 
 test('failed manual starts remove only the tabs the attempts created', async () => {

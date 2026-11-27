@@ -34,7 +34,7 @@ function fixture(total, initialFrame, virtual = true) {
   const root = {
     isConnected: true,
     clientHeight: 100,
-    scrollHeight: 100 + total * 100,
+    get scrollHeight() { return 100 + total * 100; },
     get scrollTop() { return scrollTop; },
     set scrollTop(value) {
       scrollTop = value;
@@ -46,6 +46,7 @@ function fixture(total, initialFrame, virtual = true) {
     getVirtualList: () => virtual ? root : null,
     getListRoot: rows => rows.length ? root : null,
     hasLoadedEmptyList: () => false,
+    getChat: () => null,
     getRows(_, now, ambiguousFallbacks) {
       const rendered = render(scrollTop);
       const occurrences = new Map();
@@ -73,7 +74,7 @@ function fixture(total, initialFrame, virtual = true) {
     setTimeout(callback, delay) {
       // Virtual rendering settles synchronously in the fixture. Leave the
       // ordinary capture/recovery timers idle until the test calls the entry point.
-      if (delay === 180) queueMicrotask(callback);
+      if (delay === 180 || delay === 200) queueMicrotask(callback);
       return 1;
     },
     setInterval: () => 1,
@@ -90,11 +91,12 @@ function fixture(total, initialFrame, virtual = true) {
   });
   const end = '  void hello(revision);';
   assert.ok(source.includes(end), 'content fixture must replace startup at the live script entry point');
-  vm.runInContext(source.replace(end, '  globalThis.testApi = { setSession, reportHead, seekRow, read, recoverSkipped, surveyInitial };'),
+  vm.runInContext(source.replace(end, '  globalThis.testApi = { setSession, reportHead, seekRow, read, recoverSkipped, surveyInitial, sweepList };'),
     context, { filename: 'content.js' });
   const api = context.testApi;
   api.setSession('fixture-session', 'Иван Петров', null, AT - MINUTE);
-  return { api, root, messages, replies, render: next => { render = next; } };
+  return { api, root, dom, document: context.document, messages, replies,
+    render: next => { render = next; }, setTotal: next => { total = next; } };
 }
 
 function captures(f) {
@@ -222,19 +224,88 @@ test('startup treats identical fallback keys as positional gaps rather than a mo
   assert.equal(survey.skipped, 2);
   assert.deepEqual(Array.from(survey.rows, item => item.id), [ROW_C]);
   assert.deepEqual(Array.from(survey.ambiguousKeys), [duplicate]);
-  assert.equal(survey.ranges.every(range => !range.key), true);
+  assert.deepEqual(Array.from(survey.ranges, ({ first, last, key }) => [first, last, key]),
+    [[1, 1, duplicate], [2, 2, duplicate]]);
 });
 
-test('duplicate fallback rows are counted even when they are the only rows without a virtual list', async () => {
+test('a nonvirtual fallback remains a skipped target and is recovered after its duplicate vanishes', async () => {
   const duplicate = '1:synthetic';
   const f = fixture(2, () => [row(duplicate, undefined, AT + 1), row(duplicate, undefined)], false);
-  const survey = await f.api.surveyInitial(AT - MINUTE, new AbortController(), () => true);
+  const cutoff = AT - MINUTE;
+  const survey = await f.api.surveyInitial(cutoff, new AbortController(), () => true);
 
   assert.equal(survey.complete, true);
   assert.equal(survey.skipped, 2);
   assert.equal(survey.rows.length, 0);
-  assert.equal(survey.ranges.length, 0);
+  assert.deepEqual(Array.from(survey.ranges, range => range.key), [duplicate]);
   assert.deepEqual(Array.from(survey.ambiguousKeys), [duplicate]);
+
+  f.render(() => [row(duplicate, undefined, AT + 1)]);
+  f.replies.set('monitor:recovery-next', { ok: true, recovery: {
+    id: 'nonvirtual', cutoff, targets: [{ key: duplicate }]
+  } });
+  await f.api.recoverSkipped();
+
+  const coverage = f.messages.find(message => message.type === 'monitor:coverage');
+  assert.equal(coverage.results[0].rowId, duplicate);
+  assert.deepEqual(Array.from(coverage.rows, item => item.id), [duplicate]);
+});
+
+test('virtual recovery keeps an offscreen duplicate blocked and releases a verified surviving row', async () => {
+  const duplicate = '2:synthetic chat';
+  const at = AT - 30 * MINUTE;
+  const surviving = { ...row(duplicate, 1, at), course: '2', selected: true };
+  const old = row(ROW_C, 3, AT - 46 * MINUTE);
+  const f = fixture(3, scroll => scroll === 0 ? [surviving] : [row(duplicate, 2, at), old]);
+  f.dom.getChat = () => ({ id: '1__2__7', course: '2', studentName: surviving.label,
+    messages: [{ time: at }] });
+  const cutoff = AT - 45 * MINUTE;
+  f.replies.set('monitor:recovery-next', { ok: true, recovery: {
+    id: 'virtual', cutoff, targets: [{ position: 1, key: duplicate }, { position: 2, key: duplicate }]
+  } });
+
+  await f.api.recoverSkipped();
+  const first = f.messages.filter(message => message.type === 'monitor:coverage').at(-1);
+  assert.ok(first.results.every(result => !result.resolved));
+  assert.equal(first.rows.some(item => item.id === duplicate), false);
+
+  f.setTotal(2);
+  f.render(scroll => scroll === 0 ? [surviving] : [{ ...old, position: 2 }]);
+  await f.api.recoverSkipped();
+  const next = f.messages.filter(message => message.type === 'monitor:coverage').at(-1);
+  assert.ok(next.results.some(result => result.rowId === duplicate));
+  assert.deepEqual(Array.from(next.rows, item => [item.id, item.identity]), [[duplicate, '1__2__7']]);
+});
+
+test('startup reports a foreground tab before inspecting an unloaded list and clears the block', async () => {
+  const f = fixture(1, () => []);
+  f.api.setSession('startup-session', 'Иван Петров', AT - 45 * MINUTE, null);
+  f.document.hidden = false;
+  await f.api.sweepList();
+  await f.api.sweepList();
+  assert.deepEqual(f.messages.map(message => [message.type, message.reason]), [['monitor:startup-block', 'in_use']]);
+
+  f.document.hidden = true;
+  await f.api.sweepList();
+  assert.deepEqual(f.messages.filter(message => message.type === 'monitor:startup-block').map(message => message.reason),
+    ['in_use', '']);
+  assert.equal(f.messages.find(message => message.type === 'monitor:coverage').complete, false);
+});
+
+test('an unchanged panel sends the message timestamp and precision across the startup cutoff', async () => {
+  const listRow = { ...row(ROW_A, 1, MINUTE_START, 'minute'), rowId: '1__2__1', course: '2', selected: true };
+  const f = fixture(1, () => [listRow]);
+  const request = { id: ROW_A, session: 'fixture-session', expiresAt: AT + 2 * MINUTE,
+    job: { rowKey: ROW_A, at: MINUTE_START, minActivityAt: AT + 1 } };
+  for (const [time, precision] of [[MINUTE_START, 'minute'], [AT, 'exact'], [AT + 15_000, 'exact']]) {
+    f.dom.getChat = () => ({ id: '1__2__1', course: '2', historyComplete: true,
+      messages: [{ id: 'tail', time, precision, kind: 'student', author: 'Synthetic chat' }] });
+
+    const reply = await f.api.read(request);
+    assert.equal(reply.ready, true);
+    assert.equal(reply.messages[0].at, time);
+    assert.equal(reply.messages[0].precision, precision);
+  }
 });
 
 test('a concurrent read blocks the tab and completing the first read emits an explicit wake', async () => {

@@ -12,6 +12,7 @@
     'read_error', 'tab_no_response'
   ]);
   const minute = at => Math.floor(at / MIN) * MIN;
+  const latestPossibleAt = ({ at, precision }) => at + (precision === 'minute' ? MIN - 1 : precision === 'day' ? 24 * HOUR - 1 : 0);
   // Moscow is UTC+3, an integral number of hours. Epoch-hour boundaries coincide.
   const calendarPeriodAt = now => Math.floor(now / HOUR) * HOUR;
   const periodAt = now => calendarPeriodAt(now + 5 * MIN);
@@ -49,8 +50,7 @@
   }
 
   function isStartupActivity(row, cutoff) {
-    return row.precision !== 'day' && Number.isFinite(row.at) &&
-      row.at + (row.precision === 'minute' ? MIN - 1 : 0) > cutoff;
+    return row.precision !== 'day' && Number.isFinite(row.at) && latestPossibleAt(row) > cutoff;
   }
 
   function inCheckWindow(c, now, startupCutoff = c.pending?.startupCutoff) {
@@ -873,7 +873,12 @@
     }
     const messages = h.messages;
     if (!Array.isArray(messages) || !messages.length) return fail('history_empty', unconfirmed);
-    if (messages.some((m, i) => !Number.isFinite(m?.at) || m.at > now || (i && messages[i - 1].at > m.at))) {
+    let earliest = -Infinity;
+    if (messages.some(message => {
+      if (!Number.isFinite(message?.at) || message.at > now) return true;
+      earliest = Math.max(earliest, message.at);
+      return latestPossibleAt(message) < earliest;
+    })) {
       return fail('message_time_invalid', 'История не соответствует последней активности.');
     }
     if (minute(messages.at(-1).at) < minute(job.at)) {
@@ -887,7 +892,11 @@
       return fail('message_id_duplicate', 'Идентификаторы сообщений повторяются.');
     }
     const last = list.at(-1);
-    if (last.at < minActivityAt(c, now, c.pending.startupCutoff)) {
+    const minAt = minActivityAt(c, now, c.pending.startupCutoff);
+    if (earliest < minAt) {
+      if (latestPossibleAt(last) >= minAt) {
+        return fail('message_time_unconfirmed', 'Не удалось подтвердить, что последнее сообщение попало в окно проверки.');
+      }
       c.pending = null;
       c.serial++;
       return [];

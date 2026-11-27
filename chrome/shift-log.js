@@ -197,7 +197,8 @@
 
   function missingHour(s, now) {
     const log = s.shiftLogs?.active;
-    const next = s.shiftLogs?.review?.period ?? log?.lastDutyPeriod + HOUR;
+    const last = log?.lastDutyPeriod;
+    const next = s.shiftLogs?.review?.period ?? (Number.isFinite(last) ? last + HOUR : null);
     if (!Number.isFinite(next) || typeof log?.nextOnDuty === 'boolean') return null;
     const calendar = engine.calendarPeriodAt(now);
     return next < calendar || (!s.scan.enabled && next === calendar) ? next : null;

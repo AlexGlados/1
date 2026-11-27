@@ -33,7 +33,7 @@ const blankConnection = () => ({ status: 'unknown', episode: '', since: 0, alert
 function blank() {
   return { scan: E.fresh(), tab: null, lastWatchTab: null, boot: null, ownedTab: true, doc: null, ready: false, capturedHandoff: null,
     coverage: null, connection: blankConnection(), syncAt: 0, curatorSyncAt: null,
-    tabBlock: null, lastRecoveryAt: null, pageIssue: '', pageCheckAt: 0, journalRosterRetry: null,
+    tabBlock: null, startupBlock: '', lastRecoveryAt: null, pageIssue: '', pageCheckAt: 0, journalRosterRetry: null,
     outbox: {}, routes: {}, checked: 0, notified: 0, error: '', result: '' };
 }
 
@@ -58,6 +58,7 @@ function useCurator(s, name) {
   s.doc = null;
   s.ready = false;
   s.tabBlock = null;
+  s.startupBlock = '';
   s.pageIssue = '';
   s.pageCheckAt = 0;
   s.connection = blankConnection();
@@ -84,7 +85,7 @@ function tx(fn, rollback) {
         // Older versions could use the operator's tab. Tab IDs also expire when Chrome restarts.
         Object.assign(db, { tab: null, lastWatchTab: null, doc: null, ready: false,
           connection: blankConnection(), boot: bootId, ownedTab: true, routes: {}, tabBlock: null,
-          lastRecoveryAt: null, pageIssue: '', pageCheckAt: 0 });
+          startupBlock: '', lastRecoveryAt: null, pageIssue: '', pageCheckAt: 0 });
       }
       const fileName = await curatorFile;
       if (fileName) useCurator(db, fileName);
@@ -115,7 +116,7 @@ function pause(s, reason) {
   if (Number.isInteger(s.tab)) s.lastWatchTab = s.tab;
   E.stop(s.scan);
   Object.assign(s, { tab: null, doc: null, ready: false, syncAt: 0, curatorSyncAt: null,
-    connection: blankConnection(), error: '', tabBlock: null, pageIssue: '', pageCheckAt: 0 });
+    connection: blankConnection(), error: '', tabBlock: null, startupBlock: '', pageIssue: '', pageCheckAt: 0 });
 }
 function loseMonitorTab(s, reason) {
   const now = Date.now();
@@ -124,7 +125,7 @@ function loseMonitorTab(s, reason) {
     s.result = 'Вкладка проверки закрылась. Запусти мониторинг, чтобы продолжить.';
   } else {
     shiftLog.record(s, now, 'monitor_tab_recovering', { reason });
-    Object.assign(s, { tab: null, doc: null, ready: false, tabBlock: null, pageIssue: '', pageCheckAt: 0,
+    Object.assign(s, { tab: null, doc: null, ready: false, tabBlock: null, startupBlock: '', pageIssue: '', pageCheckAt: 0,
       connection: blankConnection(), lastRecoveryAt: now, syncAt: now + 2.5 * MIN, curatorSyncAt: now + 15_000 });
   }
   s.lastWatchTab = null;
@@ -147,7 +148,7 @@ async function monitorTab(s, onCreate) {
   }
   if (tab.autoDiscardable !== false) await chrome.tabs.update(tab.id, { autoDiscardable: false }).catch(() => {});
   Object.assign(s, { tab: tab.id, lastWatchTab: tab.id, boot: bootId, doc: null, ready: false,
-    connection: blankConnection(), tabBlock: null, pageIssue: '', pageCheckAt: 0 });
+    connection: blankConnection(), tabBlock: null, startupBlock: '', pageIssue: '', pageCheckAt: 0 });
   for (const notice of Object.values(s.outbox)) notice.tab = tab.id;
   for (const route of Object.values(s.routes)) {
     if (route.boot === bootId) route.tab = tab.id;
@@ -796,7 +797,7 @@ async function checkMonitorPage(ref) {
       if (!current(s, ref)) return;
       s.pageIssue = issue;
       if (issue === 'page' || issue === 'missing') {
-        Object.assign(s, { doc: null, ready: false, tabBlock: null, connection: blankConnection() });
+        Object.assign(s, { doc: null, ready: false, tabBlock: null, startupBlock: '', connection: blankConnection() });
       } else if (!issue && !s.doc) {
         s.curatorSyncAt ??= Date.now();
       }
@@ -972,6 +973,14 @@ async function deliver(id) {
   } finally { runningDelivery = null; kick(); }
 }
 
+function setStartupBlock(s, reason) {
+  const previous = s.startupBlock;
+  if ((previous ?? '') === reason) return;
+  s.startupBlock = reason;
+  if (reason) shiftLog.record(s, Date.now(), 'chat_list_deferred', { reason });
+  else shiftLog.record(s, Date.now(), 'chat_list_resumed', { previousReason: previous });
+}
+
 async function tabMessage(m, sender) {
   if (m.type === 'monitor:rows' || (m.type === 'monitor:coverage' && Array.isArray(m.rows))) {
     await pendingHandoffRows(sender.tab.id, sender.documentId, m.session);
@@ -984,6 +993,7 @@ async function tabMessage(m, sender) {
         s.ready = false;
         s.connection = blankConnection();
         s.tabBlock = null;
+        s.startupBlock = '';
       }
       s.pageIssue = '';
       return { session: token(s), generation: s.scan.generation, curatorName: s.scan.curatorName,
@@ -1000,6 +1010,10 @@ async function tabMessage(m, sender) {
         break;
       case 'monitor:recovery-next':
         return { ok: true, recovery: nextRecoveryBatch(s.coverage) };
+      case 'monitor:startup-block':
+        if (m.reason !== '' && !TAB_BLOCKS.has(m.reason)) return { ok: false };
+        if (Number.isFinite(s.scan.startupCutoff)) setStartupBlock(s, m.reason);
+        break;
       case 'monitor:coverage': {
         if (m.recovery === true) return { ok: applyRecoveryBatch(s, m) };
         if (typeof m.complete !== 'boolean') return { ok: false };
@@ -1018,6 +1032,7 @@ async function tabMessage(m, sender) {
         if (m.complete) {
           rememberHead(s.scan, m);
           s.scan.startupCutoff = null;
+          setStartupBlock(s, '');
           s.scan.baseline = true;
           s.scan.coveragePending = false;
           s.syncAt = Math.max(s.syncAt ?? 0, Date.now() + MIN);
@@ -1115,7 +1130,7 @@ async function details(tabId) {
       checked: s.checked || 0, notified: s.notified || 0,
       pending: checkable.filter(c => c.pending).length, uncertain: uncertain.length,
       reason: failedChat ? `Не удалось проверить «${failedChat.title}». ${failedChat.reason}` : '',
-      connection: s.connection.status, tabBlock: s.pageIssue || (s.tabBlock?.retryAt > now ? s.tabBlock.reason : ''),
+      connection: s.connection.status, tabBlock: s.pageIssue || s.startupBlock || (s.tabBlock?.retryAt > now ? s.tabBlock.reason : ''),
       error: s.error };
   });
   kick();
@@ -1222,7 +1237,7 @@ async function popupMessage(m) {
       }
       await chrome.tabs.update(s.tab, { url: chatUrl });
       Object.assign(s, { ready: false, doc: null, connection: blankConnection(), tabBlock: null,
-        pageIssue: 'loading', pageCheckAt: 0, curatorSyncAt: Date.now() });
+        startupBlock: '', pageIssue: 'loading', pageCheckAt: 0, curatorSyncAt: Date.now() });
       return { ok: true };
     });
     kick();
@@ -1339,7 +1354,7 @@ chrome.tabs.onUpdated.addListener((id, change) => {
     if (s.tab !== id) return false;
     if (change.status === 'loading' || (change.url && !onChat(change.url))) {
       Object.assign(s, { ready: false, doc: null, connection: blankConnection(), tabBlock: null,
-        pageIssue: change.status === 'loading' ? 'loading' : 'page', pageCheckAt: 0 });
+        startupBlock: '', pageIssue: change.status === 'loading' ? 'loading' : 'page', pageCheckAt: 0 });
     } else if (s.tabBlock && ['discarded', 'frozen'].includes(s.tabBlock.reason)) {
       s.tabBlock.retryAt = 0;
     }

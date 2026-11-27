@@ -26,6 +26,7 @@
   let recoveryNeeded = false;
   let recovering = false;
   let startupCutoff = null;
+  let lastStartupBlock = '';
   let headThrough = null;
   let headRetryAt = 0;
   let navigation = null;
@@ -126,7 +127,8 @@
     const ordered = layout ? parsed.filter(row => Number.isSafeInteger(row.position))
       .map(row => ({ position: row.position, at: row.at, precision: row.precision }))
       .sort((a, b) => a.position - b.position) : [];
-    return { ready, observedAt, partial: true, layout, ordered, ambiguousFallbacks,
+    const fallbackConflicts = new Set(ambiguousFallbacks.keys());
+    const snapshot = { ready, observedAt, partial: true, layout, ordered, ambiguousFallbacks, fallbackConflicts,
       unrecognized: rows.filter(row => !Number.isFinite(row.at)).map(row => row.key),
       rows: ready ? parsed.map(({ key, label, fallbackKey, at, precision, pinned, signal, assignedToSelf, unread, position }) => ({
       id: key, title: label, at, precision, pinned, ...(signal ? { signal } : {}),
@@ -134,6 +136,28 @@
       ...(Number.isSafeInteger(position) ? { position } : {}), ...(typeof unread === 'boolean' ? { unread } : {}),
       ...(typeof assignedToSelf === 'boolean' ? { assignedToSelf } : {}),
     })) : [] };
+    if (ready) {
+      const keys = new Set();
+      const identified = new Set();
+      for (const { position, key } of layout?.positions ?? []) {
+        if (!key) continue;
+        if (!key.startsWith('id:') && keys.has(key)) fallbackConflicts.add(key);
+        keys.add(key);
+        identified.add(position);
+      }
+      const fullList = !layout || (rowsHavePositions(snapshot) && layout.positions.length === layout.total &&
+        coversPrefix(identified, layout.total));
+      refreshAmbiguity(snapshot.rows, snapshot.fallbackConflicts, fullList);
+    }
+    return snapshot;
+  }
+
+  function refreshAmbiguity(rows, conflicts, confirmed) {
+    for (const key of conflicts) ambiguous.add(key);
+    if (!confirmed) return;
+    for (const row of rows) {
+      if (!conflicts.has(row.id)) ambiguous.delete(row.id);
+    }
   }
 
   function publish({ ready, observedAt, rows, partial, headThrough: coveredThrough }, force = false) {
@@ -230,7 +254,9 @@
       complete = complete && stable && rememberRowOrder(snapshot, byPosition, byKey, duplicates);
       if ([...duplicates.values()].some(places => [...places].some(position => position <= last))) complete = false;
       complete &&= coversPrefix(timed, last);
-      const rows = [...found.values()].filter(row => !conflicts.has(row.id) && !duplicates.has(row.id));
+      for (const key of duplicates.keys()) conflicts.add(key);
+      const rows = [...found.values()].filter(row => !conflicts.has(row.id));
+      refreshAmbiguity(rows, conflicts, complete && last === snapshot.layout?.total);
       for (const row of rows) if (Number.isSafeInteger(row.position)) positions.set(row.id, row.position);
       if (activeSweep === controller) activeSweep = null;
       await publish({ ...snapshot, rows, headThrough: complete ? startedAt : null }, force);
@@ -333,6 +359,19 @@
       ...(!complete ? { retryAt: Date.now() + 3_000 } : {}), ...snapshot });
   }
 
+  function startupBlockReason() {
+    return inspectionBlock() || (activeRead || navigation ? 'read_busy' : '');
+  }
+
+  function reportStartupBlock(reason) {
+    if (lastStartupBlock === reason) return;
+    const sendingSession = session;
+    lastStartupBlock = reason;
+    void send({ type: 'monitor:startup-block', session, reason }).then(reply => {
+      if (session === sendingSession && lastStartupBlock === reason && !reply?.ok) lastStartupBlock = null;
+    });
+  }
+
   function moveList(root, offset, signal) {
     const top = Math.max(0, Math.min(offset, root.scrollHeight - root.clientHeight));
     if (signal.aborted || !root.isConnected || Math.abs(root.scrollTop - top) < 1) return Promise.resolve();
@@ -420,6 +459,7 @@
   }
 
   function rememberRows(found, conflicts, snapshot) {
+    for (const key of snapshot.fallbackConflicts) conflicts.add(key);
     for (const row of snapshot.rows) {
       const previous = found.get(row.id);
       if (previous && previous.position !== row.position && previous.at === row.at && !row.id.startsWith('id:')) conflicts.add(row.id);
@@ -427,9 +467,9 @@
     }
   }
 
-  function recordGaps(last, timed, keys, unrecognized) {
+  function recordGaps(last, timed, keys, unrecognized, ambiguousPositions) {
     if (!last) return { skipped: unrecognized.size, ranges: [...unrecognized].map(key => ({ key })) };
-    const positions = [...new Set([...timed, ...keys.keys()])]
+    const positions = [...new Set([...timed, ...keys.keys(), ...ambiguousPositions.keys()])]
       .filter(position => position > 0 && position <= last).sort((a, b) => a - b);
     const ranges = [];
     let skipped = 0;
@@ -444,7 +484,7 @@
         skipped += position - prior - 1;
       }
       if (position <= last && !timed.has(position)) {
-        ranges.push({ first: position, last: position, key: keys.get(position) });
+        ranges.push({ first: position, last: position, key: ambiguousPositions.get(position) ?? keys.get(position) });
         skipped++;
       }
       prior = position;
@@ -547,14 +587,16 @@
     const root = dom.getVirtualList?.();
     const current = () => session === startedSession && !controller.signal.aborted && canInspect() &&
       (!root || (root.isConnected && dom.getVirtualList?.() === root));
-    const results = [];
     const rows = new Map();
+    const tentative = new Set();
     const capture = () => {
       if (!current()) return null;
       const snapshot = scan();
       if (!snapshot.ready) return null;
       for (const row of snapshot.rows) {
-        if (row.precision !== 'day' && latestPossibleAt(row) > batch.cutoff && !ambiguous.has(row.id)) rows.set(row.id, row);
+        if (row.precision === 'day' || latestPossibleAt(row) <= batch.cutoff) continue;
+        if (ambiguous.has(row.id)) tentative.add(row.id);
+        else rows.set(row.id, row);
       }
       return snapshot;
     };
@@ -565,27 +607,44 @@
             recovery: true, recoveryId: batch.id, resurvey: true, observedAt: frame.observedAt, rows: observedRows
           }));
         if (!survey || !current() || !Array.isArray(survey.rows)) return;
-        if (survey.complete) ambiguous.clear();
-        for (const key of survey.ambiguousKeys) ambiguous.add(key);
         await reportCoverage(survey.complete, survey.rows.length, '', {
           recovery: true, recoveryId: batch.id, resurvey: true, observedAt: survey.observedAt,
           rows: survey.rows, recoveryRanges: survey.ranges, skipped: survey.skipped
         });
         return;
       }
+      // Persisted fallback targets need fresh evidence after a document reload too.
+      for (const { key } of batch.targets) {
+        if (key && !key.startsWith('id:')) {
+          ambiguous.add(key);
+          tentative.add(key);
+        }
+      }
+      const targets = [];
       for (const target of batch.targets) {
         if (!current()) return;
-        const { position, key } = target;
         const row = await recoverTarget(root, target, controller.signal, current, capture);
-        if (!current()) return;
-        const resolved = Boolean(row && !ambiguous.has(row.id));
-        results.push({ ...(Number.isSafeInteger(position) ? { position } : {}), ...(key ? { key } : {}),
-          resolved, ...(resolved ? { rowId: row.id } : {}) });
+        targets.push({ target, row });
+      }
+      if (root && [...tentative].some(key => ambiguous.has(key)) && current()) {
+        // One viewport can hide another row with the same name. Recheck the
+        // original time range before publishing an isolated fallback row.
+        const survey = await surveyInitial(batch.cutoff, controller, current);
+        if (!survey || !current()) return;
+        for (const row of survey.rows) if (tentative.has(row.id)) rows.set(row.id, row);
       }
       if (root) await moveList(root, 0, controller.signal);
       if (!current()) return;
+      scan();
+      const results = targets.map(({ target: { position, key }, row }) => {
+        const rowId = row?.id ?? key;
+        const resolved = rows.has(rowId) && !ambiguous.has(rowId);
+        return { ...(Number.isSafeInteger(position) ? { position } : {}), ...(key ? { key } : {}),
+          resolved, ...(resolved ? { rowId } : {}) };
+      });
       await reportCoverage(true, null, '', {
-        recovery: true, recoveryId: batch.id, results, observedAt: Date.now(), rows: [...rows.values()]
+        recovery: true, recoveryId: batch.id, results, observedAt: Date.now(),
+        rows: [...rows.values()].filter(row => !ambiguous.has(row.id))
       });
     } finally {
       if (current() && root?.scrollTop >= 1) await moveList(root, 0, controller.signal).catch(() => {});
@@ -614,13 +673,16 @@
     const duplicates = new Map();
     const unrecognized = new Set();
     let stable = true;
+    let positioned = true;
     const inScope = row => row.precision !== 'day' && latestPossibleAt(row) > cutoff;
     const capture = async frame => {
       rememberRows(found, conflicts, frame);
       for (const row of frame.ordered) timed.add(row.position);
       stable &&= rememberRowOrder(frame, keys, rowPositions, duplicates);
+      if (frame.layout) positioned &&= rowsHavePositions(frame) && frame.layout.total === snapshot.layout.total;
       for (const key of frame.unrecognized) unrecognized.add(key);
-      const rows = frame.rows.filter(row => inScope(row) && !conflicts.has(row.id) && !duplicates.has(row.id));
+      const rows = frame.rows.filter(row => inScope(row) && !ambiguous.has(row.id) &&
+        !conflicts.has(row.id) && !duplicates.has(row.id));
       if (rows.length) await publishRows(frame, rows);
       return !stable;
     };
@@ -637,7 +699,8 @@
       complete = outcome.complete;
       last = outcome.last;
       const latest = scan();
-      if (latest.ready) await capture(latest);
+      if (latest.ready && latest.layout?.total === snapshot.layout.total) await capture(latest);
+      else complete = false;
     } else {
       await capture(snapshot);
     }
@@ -646,15 +709,31 @@
     let ambiguousCount = 0;
     for (const [key, count] of snapshot.ambiguousFallbacks) {
       conflicts.add(key);
-      ambiguousCount += count;
+      unrecognized.add(key);
+      ambiguousCount += count - 1;
     }
+    const ambiguousPositions = new Map();
     for (const [key, places] of duplicates) {
       conflicts.add(key);
       unrecognized.delete(key);
-      for (const position of places) timed.delete(position);
+      for (const position of places) {
+        timed.delete(position);
+        ambiguousPositions.set(position, key);
+      }
     }
-    const rows = [...found.values()].filter(row => !conflicts.has(row.id) && inScope(row));
-    const { skipped, ranges } = stable ? recordGaps(last, timed, keys, unrecognized) : { skipped: null, ranges: [] };
+    const candidates = [...found.values()].filter(row => !conflicts.has(row.id) && inScope(row));
+    const identified = new Set([...keys.keys(), ...ambiguousPositions.keys()]);
+    refreshAmbiguity(candidates.filter(row => !snapshot.layout || row.position <= last), conflicts,
+      complete && (!snapshot.layout || (positioned && coversPrefix(identified, last))));
+    const rows = candidates.filter(row => !ambiguous.has(row.id));
+    for (const row of candidates) {
+      if (ambiguous.has(row.id) && Number.isSafeInteger(row.position)) {
+        timed.delete(row.position);
+        ambiguousPositions.set(row.position, row.id);
+      }
+    }
+    const { skipped, ranges } = stable ? recordGaps(last, timed, keys, unrecognized, ambiguousPositions)
+      : { skipped: null, ranges: [] };
     return { complete, rows, skipped: skipped === null ? null : skipped + ambiguousCount,
       ranges, ambiguousKeys: [...conflicts], observedAt: Date.now(), startedAt,
       reason: complete ? '' : 'Не удалось завершить начальный просмотр чатов.' };
@@ -662,7 +741,9 @@
 
   async function sweepList() {
     if (!session || !Number.isFinite(startupCutoff)) return;
-    if (activeRead || navigation || !canInspect()) {
+    const block = startupBlockReason();
+    reportStartupBlock(block);
+    if (block) {
       scheduleSweep(3_000);
       return;
     }
@@ -674,9 +755,7 @@
     try {
       const result = await surveyInitial(cutoff, controller, current, (frame, rows) => publish({ ...frame, rows }));
       if (!result || !current()) return;
-      const { complete, rows, skipped, ranges, ambiguousKeys, observedAt, startedAt, reason } = result;
-      ambiguous.clear();
-      for (const key of ambiguousKeys) ambiguous.add(key);
+      const { complete, rows, skipped, ranges, observedAt, startedAt, reason } = result;
       positions.clear();
       for (const row of rows) if (Number.isSafeInteger(row.position)) positions.set(row.id, row.position);
       const reply = await reportCoverage(complete, rows.length, reason,
@@ -690,6 +769,7 @@
     } finally {
       if (activeSweep === controller) activeSweep = null;
       if (session !== startedSession) return;
+      if (Number.isFinite(startupCutoff)) reportStartupBlock(startupBlockReason());
       if (canInspect()) void send({ type: 'monitor:wake', session });
       scheduleCapture();
       scheduleSweep(3_000);
@@ -723,6 +803,7 @@
       lastCapture = '';
       session = next;
       startupCutoff = next && Number.isFinite(cutoff) ? cutoff : null;
+      lastStartupBlock = '';
       headThrough = next && Number.isFinite(coveredThrough) ? coveredThrough : null;
       curatorName = nextCurator;
       dom.setCuratorName?.(curatorName);
@@ -765,7 +846,9 @@
 
   function lookup(id) {
     if (ambiguous.has(id)) return null;
-    const rows = dom.getRows(dom.getVirtualList?.() || (listRoot?.isConnected ? listRoot : document));
+    const conflicts = new Map();
+    const rows = dom.getRows(dom.getVirtualList?.() || (listRoot?.isConnected ? listRoot : document), Date.now(), conflicts);
+    for (const key of conflicts.keys()) ambiguous.add(key);
     return rows.find(row => row.key === id);
   }
 
@@ -896,7 +979,7 @@
           fingerprint = '';
         } else {
           const last = chat.messages.at(-1);
-          const mark = JSON.stringify([chat.id, chat.messages.length, last.time, last.author, last.id]);
+          const mark = JSON.stringify([chat.id, chat.messages.length, last.time, last.precision, last.author, last.id]);
           if (mark === fingerprint) return;
           fingerprint = mark;
           clearTimeout(settle);
@@ -908,7 +991,7 @@
         }
       }
       changes.observe(document.body, { subtree: true, childList: true, characterData: true, attributes: true,
-        attributeFilter: ['aria-busy', 'aria-selected', 'data-message-id', 'data-last-message-id'] });
+        attributeFilter: ['aria-busy', 'aria-selected', 'data-message-id', 'data-last-message-id', 'datetime', 'title'] });
       controller.signal.addEventListener('abort', abort, { once: true });
       deadline = setTimeout(() => finish(null), 4_500);
       sample();
@@ -918,11 +1001,11 @@
   const role = { student: 'student', curator: 'staff', own: 'own', service: 'service', unknown: 'unknown' };
   function metadata(chat) {
     const counts = new Map();
-    return chat.messages.map(({ id, author, time, kind, requiresReply }) => {
+    return chat.messages.map(({ id, author, time, precision, kind, requiresReply }) => {
       const key = JSON.stringify([normalizeName(author), time]);
       const ordinal = (counts.get(key) || 0) + 1;
       counts.set(key, ordinal);
-      return { ...(id ? { id } : {}), author, at: time, role: role[kind] || 'unknown', ordinal,
+      return { ...(id ? { id } : {}), author, at: time, precision, role: role[kind] || 'unknown', ordinal,
         ...(typeof requiresReply === 'boolean' ? { requiresReply } : {}) };
     });
   }
@@ -1014,12 +1097,11 @@
       if (controller.signal.aborted || !allowed()) return fail('read_error', 'Чтение прервано.', true);
       const latestRow = lookup(rowKey);
       const latest = dom.getChat();
-      if (ambiguous.has(rowKey) || latestRow?.selected === false || !panelMatches(latest, row, chat.id) ||
-          latest.messages.at(-1).time < minActivityAt) {
+      if (ambiguous.has(rowKey) || latestRow?.selected === false || !panelMatches(latest, row, chat.id)) {
         return fail('panel_changed', 'Вкладка или переписка изменилась.');
       }
       const messages = metadata(latest);
-      watchMinute(latestRow || row, latest.id, job, messages);
+      if (messages.at(-1).at >= minActivityAt) watchMinute(latestRow || row, latest.id, job, messages);
       return { id, ready: true, identity: latest.id, startReached: latest.historyComplete,
         ...(typeof latest.assignedToSelf === 'boolean' ? { assignedToSelf: latest.assignedToSelf } : {}),
         complete: coveredEpisode(latest), sinceCovered: coveredPin(latest), messages };
