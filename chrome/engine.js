@@ -8,7 +8,8 @@
   const STARTUP_MAX_AGE = 45 * MIN;
   const WAIT_MAX_AGE = 12 * HOUR;
   const READ_FAILURE_CODES = new Set([
-    'row_unavailable', 'row_time_boundary', 'history_unconfirmed', 'panel_changed', 'read_error', 'tab_no_response'
+    'row_unavailable', 'row_range_unavailable', 'row_time_boundary', 'history_unconfirmed', 'panel_changed',
+    'read_error', 'tab_no_response'
   ]);
   const minute = at => Math.floor(at / MIN) * MIN;
   // Moscow is UTC+3, an integral number of hours. Epoch-hour boundaries coincide.
@@ -47,8 +48,15 @@
     return Math.max(now - checkMaxAge(c, startupCutoff), startupCutoff ?? -Infinity) + 1;
   }
 
+  function isStartupActivity(row, cutoff) {
+    return row.precision !== 'day' && Number.isFinite(row.at) &&
+      row.at + (row.precision === 'minute' ? MIN - 1 : 0) > cutoff;
+  }
+
   function inCheckWindow(c, now, startupCutoff = c.pending?.startupCutoff) {
-    return c.precision !== 'day' && Number.isFinite(c.at) && c.at <= now && c.at >= minActivityAt(c, now, startupCutoff);
+    if (c.precision === 'day' || !Number.isFinite(c.at) || c.at > now ||
+        c.at < now - checkMaxAge(c, startupCutoff) + 1) return false;
+    return !Number.isFinite(startupCutoff) || isStartupActivity(c, startupCutoff);
   }
 
   function fresh() {
@@ -1128,7 +1136,7 @@
     boundary, prefetchTime, scheduleTarget, installRoster, curatorDuty,
     observe, reconcileRows, panelChanged, earliest, next, defer, apply, navigation,
     setMode, setPinnedInstant, dueNotices, nextNoticeAt, noticeEligible, setChatMute, unbind, isFree, freeVersion, dismissFree,
-    waitingSince, isRecentChat: inWindow, isCheckableChat: inCheckWindow };
+    waitingSince, isRecentChat: inWindow, isCheckableChat: inCheckWindow, isStartupActivity };
   globalThis.ChatEngine = api;
   if (typeof module !== 'undefined') module.exports = api;
 })();

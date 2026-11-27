@@ -120,7 +120,11 @@ function fixture() {
     vm.runInContext(readFileSync(join(__dirname, '../chrome', file), 'utf8'), context, { filename: file });
   }
   load('background.js');
-  context.ShSchedule = { read: (...args) => controls.schedule(...args) };
+  const schedule = context.ShSchedule;
+  context.ShSchedule = {
+    ...schedule,
+    read: (...args) => controls.useRealSchedule ? schedule.read(...args) : controls.schedule(...args)
+  };
   context.ShkolkovoLogFolder = { write: async () => false };
   const state = vm.runInContext(`(() => {
     const state = blank();
@@ -145,6 +149,7 @@ function fixture() {
     plan: () => vm.runInContext('plan()', context),
     popup: type => dispatch({ url: ORIGIN + 'popup.html' }, { type }),
     report: fields => fromContent('monitor:coverage', fields),
+    wake: fields => fromContent('monitor:wake', fields),
     recovery: () => fromContent('monitor:recovery-next'),
     async reload() {
       chrome.tabs.onUpdated.emit(tab.id, { status: 'loading' });
@@ -331,6 +336,82 @@ test('stopping the targeted search at the time boundary has a distinct journal c
   await settle();
   const failure = f.saved().shiftLogs.active.events.find(event => event.event === 'chat_check_failed');
   assert.equal(failure.details.reason, 'row_time_boundary');
+});
+
+test('an unavailable range before the time boundary has its own journal code', async () => {
+  const f = fixture();
+  f.state.scan.startupCutoff = START - 45 * MINUTE;
+  f.controls.read = () => ({ ready: false, reasonCode: 'row_range_unavailable' });
+  await f.report({ complete: true, partial: true, recoveryRanges: [],
+    rows: [{ id: 'target', title: 'Fixture title', at: START - 5 * MINUTE, precision: 'minute' }] });
+  await f.plan();
+  await settle();
+  const failure = f.saved().shiftLogs.active.events.find(event => event.event === 'chat_check_failed');
+  assert.equal(failure.details.reason, 'row_range_unavailable');
+});
+
+test('a busy tab defers the entire queue and resumes immediately on read completion', async () => {
+  const f = fixture();
+  f.state.scan.startupCutoff = START - 45 * MINUTE;
+  const rows = Array.from({ length: 16 }, (_, index) => ({
+    id: 'chat-' + index, title: 'Fixture', at: START - 5 * MINUTE - index * MINUTE, precision: 'minute'
+  }));
+  f.controls.read = () => ({ blocked: true, tabBlock: 'read_busy' });
+  await f.report({ complete: true, partial: true, recoveryRanges: [], rows });
+  await f.plan();
+  await settle();
+  assert.equal(f.reads.length, 1);
+  assert.equal(f.saved().tabBlock.reason, 'read_busy');
+  for (let attempt = 0; attempt < 3; attempt++) await f.plan();
+  await f.wake();
+  await f.plan();
+  await settle();
+  assert.equal(f.reads.length, 1);
+  f.advance(10_000);
+  await f.plan();
+  await settle();
+  assert.equal(f.reads.length, 2);
+  assert.equal(f.reads[0], f.reads[1]);
+  const deferred = f.saved().shiftLogs.active.events.filter(event => event.event === 'chat_check_deferred');
+  assert.deepEqual(deferred.map(event => event.details.reason), ['read_busy']);
+  f.controls.read = null;
+  await f.wake({ readReady: true });
+  await f.plan();
+  await settle();
+  for (let pass = 0; pass < rows.length - 1; pass++) {
+    await f.plan();
+    await settle();
+  }
+  assert.equal(f.saved().checked, rows.length);
+});
+
+test('completion delivered before a busy reply still allows the next read', async () => {
+  const f = fixture();
+  f.state.scan.startupCutoff = START - 45 * MINUTE;
+  f.controls.read = async () => {
+    f.controls.read = null;
+    await f.wake({ readReady: true });
+    return { blocked: true, tabBlock: 'read_busy' };
+  };
+  await f.report({ complete: true, partial: true, recoveryRanges: [],
+    rows: [{ id: 'target', title: 'Fixture', at: START - 5 * MINUTE, precision: 'minute' }] });
+  await f.plan();
+  await settle();
+  assert.equal(f.saved().tabBlock.retryAt, START);
+  await f.plan();
+  await settle();
+  assert.equal(f.saved().checked, 1);
+});
+
+test('a schedule failure records the fixed cause without the underlying error details', async () => {
+  const f = fixture();
+  f.state.scan.roster = null;
+  f.controls.useRealSchedule = true;
+  await f.plan();
+  await settle();
+  const failure = f.saved().shiftLogs.active.events.find(event => event.event === 'schedule_failed');
+  assert.equal(failure.details.reason, 'schedule_config');
+  assert.deepEqual(Object.keys(failure.details).sort(), ['hourMsk', 'reason']);
 });
 
 test('failed manual starts remove only the tabs the attempts created', async () => {

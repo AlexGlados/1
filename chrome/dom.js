@@ -230,7 +230,7 @@
     return { total: sizes.size === 1 ? [...sizes][0] : null, positions };
   }
 
-  function getRows(listRoot = document, now = Date.now()) {
+  function getRows(listRoot = document, now = Date.now(), ambiguousFallbacks = null) {
     const rows = new Map();
     const ambiguous = new Set();
     const virtual = listRoot === document ? getVirtualList() : null;
@@ -250,6 +250,7 @@
       const key = rowId ? 'id:' + rowId : fallbackKey;
       if (rows.has(key)) {
         ambiguous.add(key);
+        if (!rowId && ambiguousFallbacks) ambiguousFallbacks.set(key, (ambiguousFallbacks.get(key) ?? 1) + 1);
         continue;
       }
 

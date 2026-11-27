@@ -11,7 +11,7 @@ const TAB_RETRY = 10_000;
 const PAGE_CHECK_INTERVAL = 30_000;
 const JOURNAL_RETRY = 5 * MIN;
 const RECOVERY_BATCH_SIZE = 8;
-const TAB_BLOCKS = new Set(['in_use', 'draft', 'connection', 'loading', 'frozen', 'discarded', 'page', 'missing', 'list_scan']);
+const TAB_BLOCKS = new Set(['in_use', 'draft', 'connection', 'loading', 'frozen', 'discarded', 'page', 'missing', 'list_scan', 'read_busy']);
 const KEY = 'shkolkovo.monitor.v2';
 const BOOT = 'shkolkovo.browserSession';
 const HOUR_ALARM = 'shkolkovo.period';
@@ -261,6 +261,7 @@ function connection(s, status, verified = false) {
 let timer;
 let queued = false;
 let runningRead;
+let lastReadWake;
 let runningSync;
 let runningProbe;
 let runningPageCheck;
@@ -345,9 +346,30 @@ function readRecoveryRanges(value) {
   return ranges;
 }
 
+function recoveryRangeCount(ranges) {
+  return ranges.reduce((total, range) => total + (range.first === undefined ? 1 : range.last - range.first + 1), 0);
+}
+
+function legacyResurvey(coverage, work) {
+  if (work.anchored) return null;
+  if (work.resurvey) return work.resurvey;
+  const targets = work.batch?.targets ?? [];
+  const lacksAnchors = target => !target.key && !target.before && !target.after;
+  const hasUnanchoredPositions = work.ranges.some(lacksAnchors) || targets.some(lacksAnchors);
+  const exhaustedPositions = coverage.skipped > recoveryRangeCount(work.ranges) + targets.length;
+  if (Number.isFinite(coverage.cutoff) && (hasUnanchoredPositions || exhaustedPositions)) {
+    work.resurvey = { id: crypto.randomUUID(), cutoff: coverage.cutoff, resurvey: true };
+    return work.resurvey;
+  }
+  work.anchored = true;
+  return null;
+}
+
 function nextRecoveryBatch(coverage) {
   const work = coverage?.recovery;
   if (!coverage?.complete || !work) return null;
+  const resurvey = legacyResurvey(coverage, work);
+  if (resurvey) return resurvey;
   if (work.batch) return work.batch;
   const targets = [];
   while (targets.length < RECOVERY_BATCH_SIZE && work.ranges.length) {
@@ -378,7 +400,7 @@ function coverageIdentity(chats) {
 
 function countableRows(rows, cutoff, now, identify) {
   return rows.filter(row => row && typeof row.id === 'string' && row.id &&
-    row.precision !== 'day' && Number.isFinite(row.at) && row.at > cutoff && row.at <= now)
+    row.at <= now && E.isStartupActivity(row, cutoff))
     .map(row => identify(row.id)).filter(Boolean);
 }
 
@@ -395,11 +417,47 @@ function retryRecoveryTarget(ranges, target) {
   }
 }
 
+function applyRecoverySurvey(s, message) {
+  const coverage = s.coverage;
+  const work = coverage.recovery;
+  if (work.resurvey?.id !== message.recoveryId || typeof message.complete !== 'boolean' ||
+      !Array.isArray(message.rows)) return false;
+  const ranges = message.complete ? readRecoveryRanges(message.recoveryRanges) : null;
+  if (message.complete && !ranges) return false;
+  const startedKeys = Object.values(s.scan.chats)
+    .filter(chat => chat.startupQueuedCutoff === coverage.cutoff).map(chat => chat.id);
+  const earlierKeys = coverage.scannedKeys ?? startedKeys;
+  const oldCount = new Set(earlierKeys).size;
+  if (!addRows(s, message, coverage.cutoff)) return false;
+  const identify = coverageIdentity(s.scan.chats);
+  const counted = new Set(earlierKeys.map(identify).filter(Boolean));
+  for (const key of countableRows(message.rows, coverage.cutoff, Date.now(), identify)) counted.add(key);
+  coverage.scannedKeys = [...counted];
+  coverage.scanned = Math.max(0, (coverage.scanned ?? 0) + counted.size - oldCount);
+  if (message.complete) {
+    const skipped = Number.isSafeInteger(message.skipped) && message.skipped >= 0 ? message.skipped : 0;
+    coverage.skipped = Math.max(skipped, recoveryRangeCount(ranges));
+    coverage.reason = '';
+    coverage.retryAt = null;
+    const known = [...counted, ...startedKeys, ...(work.originalKeys ?? [])].map(identify).filter(Boolean);
+    coverage.recovery = { ranges, batch: null, acknowledged: message.recoveryId, anchored: true,
+      originalKeys: ranges.length ? [...new Set(known)] : [] };
+    if (!ranges.length) delete coverage.scannedKeys;
+  }
+  if (message.complete || counted.size !== oldCount) shiftLog.record(s, Date.now(), 'chat_list_reviewed', {
+    complete: message.complete, partial: coverage.partial, scanned: coverage.scanned, total: coverage.total,
+    skipped: coverage.skipped, resurvey: true
+  });
+  return true;
+}
+
 function applyRecoveryBatch(s, message) {
   const coverage = s.coverage;
   const work = coverage?.recovery;
   if (!coverage?.complete || !work || typeof message.recoveryId !== 'string') return false;
   if (work.acknowledged === message.recoveryId) return true;
+  if (message.resurvey === true) return applyRecoverySurvey(s, message);
+  if (work.resurvey) return false;
   const batch = work.batch;
   if (!batch || batch.id !== message.recoveryId || !Array.isArray(message.results) ||
       message.results.length !== batch.targets.length || !Array.isArray(message.rows)) return false;
@@ -678,15 +736,19 @@ async function readSchedule(generation, period) {
   const moscow = clock.moscowHour(period);
   let result;
   let error;
+  let reason;
   try { result = await ShSchedule.read(moscow.date, moscow.hour); }
-  catch (e) { error = e.message || 'Не удалось прочитать таблицу.'; }
+  catch (e) {
+    error = e?.message || 'Не удалось прочитать таблицу.';
+    reason = ShSchedule.errorCode(e);
+  }
   try {
     await tx(s => {
       const now = Date.now();
       if (monitoring(s) && E.installRoster(s.scan, { generation, period }, result?.names, error, now, result?.directory)) {
         shiftLog.record(s, now, result ? 'schedule_loaded' : 'schedule_failed', {
           hourMsk: `${moscow.date}T${moscow.time}:00${moscow.offset}`,
-          ...(result && { rosterSize: result.names.length })
+          ...(result ? { rosterSize: result.names.length } : { reason })
         });
       }
     });
@@ -699,12 +761,19 @@ async function readSchedule(generation, period) {
 async function readJournalHour(request) {
   try {
     const moscow = clock.moscowHour(request.period);
-    const roster = await ShSchedule.read(moscow.date, moscow.hour).catch(() => null);
+    let reason;
+    const roster = await ShSchedule.read(moscow.date, moscow.hour).catch(error => {
+      reason = ShSchedule.errorCode(error);
+      return null;
+    });
     await tx(s => {
       if (shiftLog.lookupId(s) !== request.logId) return;
       const now = Date.now();
       if (shiftLog.missingHour(s, now) !== request.period) return;
       const confirmed = roster && shiftLog.confirmHour(s, now, request.period, roster.names, roster.directory);
+      if (reason) shiftLog.record(s, now, 'schedule_failed', {
+        hourMsk: `${moscow.date}T${moscow.time}:00${moscow.offset}`, reason, scope: 'journal'
+      });
       s.journalRosterRetry = confirmed ? null : { ...request, at: now + JOURNAL_RETRY };
     });
   } finally {
@@ -740,6 +809,7 @@ async function checkMonitorPage(ref) {
 
 async function readChat(ref, job) {
   let history;
+  let wakeBefore;
   try {
     const tabBlock = await tabBlockReason(ref.tab);
     if (tabBlock) history = { blocked: true, tabBlock };
@@ -753,6 +823,7 @@ async function readChat(ref, job) {
       const expiresAt = Math.min(Date.now() + 28_000, job.expiresAt ?? Infinity,
         job.pinned ? Infinity : job.period + 55 * MIN);
       if (Date.now() >= expiresAt) return;
+      wakeBefore = lastReadWake;
       history = await send(ref.tab, { type: 'monitor:read', session: ref.session,
         id: job.id, sinceAt: job.sinceAt, expiresAt, job }, ref.doc);
       if (!history) history = { ready: false, reasonCode: 'tab_no_response' };
@@ -768,7 +839,9 @@ async function readChat(ref, job) {
             if (s.tabBlock?.reason !== history.tabBlock) {
               shiftLog.record(s, now, 'chat_check_deferred', { reason: history.tabBlock });
             }
-            s.tabBlock = { reason: history.tabBlock, retryAt: now + TAB_RETRY };
+            const wokeInFlight = history.tabBlock === 'read_busy' && lastReadWake !== wakeBefore &&
+              lastReadWake?.tab === ref.tab && lastReadWake.doc === ref.doc && lastReadWake.session === ref.session;
+            s.tabBlock = { reason: history.tabBlock, retryAt: wokeInFlight ? now : now + TAB_RETRY };
           } else {
             s.tabBlock = null;
             E.defer(s.scan, job, now, TAB_RETRY);
@@ -952,7 +1025,7 @@ async function tabMessage(m, sender) {
         const count = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
         const complete = m.complete;
         const reason = !complete && typeof m.reason === 'string' ? m.reason.slice(0, 200) : '';
-        const trackedGaps = ranges?.reduce((total, range) => total + (range.first === undefined ? 1 : range.last - range.first + 1), 0);
+        const trackedGaps = ranges ? recoveryRangeCount(ranges) : 0;
         const skipped = Math.max(count(m.skipped) ?? 0, trackedGaps ?? 0);
         const scannedKeys = hasRows
           ? [...new Set(countableRows(m.rows, startupCutoff, Date.now(), coverageIdentity(s.scan.chats)))] : null;
@@ -962,7 +1035,7 @@ async function tabMessage(m, sender) {
           complete, cutoff: startupCutoff, partial: m.partial === true || skipped > 0,
           scanned: scannedKeys?.length ?? count(m.scanned), total: count(m.total), skipped, reason,
           ...(complete ? { scannedKeys, recovery: {
-            ranges, batch: null, acknowledged: null, originalKeys
+            ranges, batch: null, acknowledged: null, originalKeys, anchored: true
           } } : {}),
           retryAt: Number.isFinite(m.retryAt) ? m.retryAt : null
         };
@@ -979,7 +1052,9 @@ async function tabMessage(m, sender) {
         if (s.connection.status === m.status) connection(s, m.status, true);
         break;
       case 'monitor:wake':
-        if (['in_use', 'list_scan'].includes(s.tabBlock?.reason)) s.tabBlock.retryAt = 0;
+        if (m.readReady === true) lastReadWake = { tab: sender.tab.id, doc: sender.documentId, session: m.session };
+        if (['in_use', 'list_scan'].includes(s.tabBlock?.reason) ||
+            (s.tabBlock?.reason === 'read_busy' && m.readReady === true)) s.tabBlock.retryAt = 0;
         break;
       case 'monitor:panel-change':
         E.panelChanged(s.scan, m, Date.now());
@@ -1032,7 +1107,7 @@ async function details(tabId) {
     const free = chats.filter(c => E.isFree(c, now)).map(c => ({
       id: c.id, title: c.title, version: E.freeVersion(c), ...waiting(c, now)
     })).sort((a, b) => (a.waitingSince ?? Infinity) - (b.waitingSince ?? Infinity) || a.title.localeCompare(b.title, 'ru'));
-    return { ...summary(s), canStart: Boolean(s.scan.curatorName), supportsFreeDismissal: true, rulesVersion: 8,
+    return { ...summary(s), canStart: Boolean(s.scan.curatorName), supportsFreeDismissal: true, rulesVersion: 9,
       attached: Number.isSafeInteger(s.lastWatchTab),
       here: monitoring(s) && tabId === s.tab, ready: monitoring(s) && s.ready, pinnedInstant: s.scan.pinnedImmediate !== false,
       scanComplete: s.coverage?.complete ?? null, scanStatus: coverageLabel(s), free,

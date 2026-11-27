@@ -16,7 +16,8 @@ const tabBlockLabels = {
   discarded: 'Chrome выгрузил вкладку проверки. Открой её, затем вернись в рабочую вкладку.',
   page: 'Скрипт проверки доступен на странице чатов Школково.',
   missing: 'Жду доступную вкладку проверки.',
-  list_scan: 'Обновляю начало списка чатов.'
+  list_scan: 'Обновляю начало списка чатов.',
+  read_busy: 'Жду завершения работы с открытым чатом.'
 };
 const clock = globalThis.ShkolkovoTime;
 const HOUR = 3_600_000;
@@ -95,7 +96,7 @@ function draw(s) {
   el('update-version').textContent = s?.update?.version ? 'Доступна версия ' + s.update.version : '';
   const local = clock.local();
   message('time-zone', 'Часовой пояс · ' + local.zoneLabel(Date.now()));
-  const currentWorker = s?.rulesVersion === 8;
+  const currentWorker = s?.rulesVersion === 9;
   const curatorRequired = currentWorker && s.curatorRequired === true;
   const canStart = s?.canStart ?? s?.attached;
   const status = !hasExtension ? 'Открой это меню через кнопку расширения в Chrome.'

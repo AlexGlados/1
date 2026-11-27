@@ -17,7 +17,7 @@ function row(key, position, at = AT, precision = 'exact') {
   return { key, position, at, precision, label: 'Synthetic chat', element: { isConnected: true } };
 }
 
-function fixture(total, initialFrame) {
+function fixture(total, initialFrame, virtual = true) {
   let render = initialFrame;
   let scrollTop = 0;
   const observers = new Set();
@@ -43,8 +43,18 @@ function fixture(total, initialFrame) {
     querySelectorAll: () => []
   };
   const dom = {
-    getVirtualList: () => root,
-    getRows: () => render(scrollTop),
+    getVirtualList: () => virtual ? root : null,
+    getListRoot: rows => rows.length ? root : null,
+    hasLoadedEmptyList: () => false,
+    getRows(_, now, ambiguousFallbacks) {
+      const rendered = render(scrollTop);
+      const occurrences = new Map();
+      for (const row of rendered) occurrences.set(row.key, (occurrences.get(row.key) ?? 0) + 1);
+      for (const [key, count] of occurrences) {
+        if (!key.startsWith('id:') && count > 1) ambiguousFallbacks?.set(key, count);
+      }
+      return rendered.filter(row => occurrences.get(row.key) === 1);
+    },
     getListLayout: () => ({ total, positions: render(scrollTop).map(({ position, key }) => ({
       position, key, top: (position - 1) * 100
     })) }),
@@ -80,7 +90,7 @@ function fixture(total, initialFrame) {
   });
   const end = '  void hello(revision);';
   assert.ok(source.includes(end), 'content fixture must replace startup at the live script entry point');
-  vm.runInContext(source.replace(end, '  globalThis.testApi = { setSession, reportHead, seekRow, read, recoverSkipped };'),
+  vm.runInContext(source.replace(end, '  globalThis.testApi = { setSession, reportHead, seekRow, read, recoverSkipped, surveyInitial };'),
     context, { filename: 'content.js' });
   const api = context.testApi;
   api.setSession('fixture-session', 'Иван Петров', null, AT - MINUTE);
@@ -166,6 +176,78 @@ test('targeted search reports a distinct reason when it reaches older rows', asy
     job: { rowKey: ROW_C, at: AT, minActivityAt: AT - 5 * MINUTE } });
   assert.equal(reply.ready, false);
   assert.equal(reply.reasonCode, 'row_time_boundary');
+});
+
+test('targeted search reopens a gap above the older boundary before stopping', async () => {
+  const f = fixture(3, scroll => scroll === 0
+    ? [row(ROW_A, 1, AT + 1), row(ROW_C, 3, MINUTE_START - MINUTE)]
+    : [row(ROW_B, 2), row(ROW_C, 3, MINUTE_START - MINUTE)]);
+  const search = {};
+  const result = await f.api.seekRow(
+    ROW_B, undefined, new AbortController().signal, () => true, AT + 2 * MINUTE, AT - MINUTE, AT, search
+  );
+
+  assert.equal(result?.key, ROW_B);
+  assert.equal(search.reasonCode, undefined);
+});
+
+test('targeted search distinguishes an inaccessible gap from a verified time boundary', async () => {
+  const f = fixture(3, () => [row(ROW_A, 1, AT + 1), row(ROW_C, 3, MINUTE_START - MINUTE)]);
+  const reply = await f.api.read({ id: ROW_B, session: 'fixture-session', expiresAt: AT + 2 * MINUTE,
+    job: { rowKey: ROW_B, at: AT, minActivityAt: AT - 5 * MINUTE } });
+
+  assert.equal(reply.ready, false);
+  assert.equal(reply.reasonCode, 'row_range_unavailable');
+});
+
+test('startup includes the minute that overlaps the cutoff and scans the following row', async () => {
+  const f = fixture(3, scroll => scroll === 0
+    ? [row(ROW_A, 1, MINUTE_START, 'minute')]
+    : [row(ROW_B, 2, AT + 10_000), row(ROW_C, 3, MINUTE_START - MINUTE)]);
+  const survey = await f.api.surveyInitial(AT, new AbortController(), () => true);
+
+  assert.equal(survey.complete, true);
+  assert.equal(survey.skipped, 0);
+  assert.deepEqual(Array.from(survey.rows, item => item.id), [ROW_A, ROW_B]);
+});
+
+test('startup treats identical fallback keys as positional gaps rather than a moving chat', async () => {
+  const duplicate = '1:synthetic';
+  const f = fixture(3, scroll => scroll === 0
+    ? [row(duplicate, 1, AT + 1)]
+    : [row(duplicate, 2), row(ROW_C, 3)]);
+  const survey = await f.api.surveyInitial(AT - MINUTE, new AbortController(), () => true);
+
+  assert.equal(survey.complete, true);
+  assert.equal(survey.skipped, 2);
+  assert.deepEqual(Array.from(survey.rows, item => item.id), [ROW_C]);
+  assert.deepEqual(Array.from(survey.ambiguousKeys), [duplicate]);
+  assert.equal(survey.ranges.every(range => !range.key), true);
+});
+
+test('duplicate fallback rows are counted even when they are the only rows without a virtual list', async () => {
+  const duplicate = '1:synthetic';
+  const f = fixture(2, () => [row(duplicate, undefined, AT + 1), row(duplicate, undefined)], false);
+  const survey = await f.api.surveyInitial(AT - MINUTE, new AbortController(), () => true);
+
+  assert.equal(survey.complete, true);
+  assert.equal(survey.skipped, 2);
+  assert.equal(survey.rows.length, 0);
+  assert.equal(survey.ranges.length, 0);
+  assert.deepEqual(Array.from(survey.ambiguousKeys), [duplicate]);
+});
+
+test('a concurrent read blocks the tab and completing the first read emits an explicit wake', async () => {
+  const f = fixture(1, () => [row(ROW_A, 1, MINUTE_START - MINUTE)]);
+  const request = { id: ROW_B, session: 'fixture-session', expiresAt: AT + 2 * MINUTE,
+    job: { rowKey: ROW_B, at: AT, minActivityAt: AT - 5 * MINUTE } };
+  const first = f.api.read(request);
+  const parallel = await f.api.read(request);
+
+  assert.equal(parallel.blocked, true);
+  assert.equal(parallel.tabBlock, 'read_busy');
+  assert.equal((await first).reasonCode, 'row_time_boundary');
+  assert.ok(f.messages.some(message => message.type === 'monitor:wake' && message.readReady));
 });
 
 function recoverPosition(f) {
