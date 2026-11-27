@@ -4,7 +4,8 @@
   'use strict';
   const MIN = 60_000;
   const HOUR = 60 * MIN;
-  const RECENT_MAX_AGE = 20 * MIN; // Matches the recent list limit in dom.js.
+  const RECENT_MAX_AGE = 20 * MIN; // Fresh activity for ordinary unbound reads and alerts.
+  const STARTUP_MAX_AGE = 45 * MIN;
   const WAIT_MAX_AGE = 12 * HOUR;
   const minute = at => Math.floor(at / MIN) * MIN;
   // Moscow is UTC+3, an integral number of hours. Epoch-hour boundaries coincide.
@@ -27,11 +28,30 @@
   }
   const hasChecked = c => c.checked && c.checked.at === c.at && c.checked.signal === c.signal;
 
+  function prepareStartup(s, now) {
+    s.startupCutoff = now - STARTUP_MAX_AGE;
+    s.headThrough = null;
+    s.rowsObservedAt = null;
+    s.baseline = false;
+  }
+
+  function checkMaxAge(c, startupCutoff) {
+    return Number.isFinite(startupCutoff) || c.binding || c.pinnedColleague || c.unread ? WAIT_MAX_AGE : RECENT_MAX_AGE;
+  }
+
+  function minActivityAt(c, now, startupCutoff) {
+    return Math.max(now - checkMaxAge(c, startupCutoff), startupCutoff ?? -Infinity) + 1;
+  }
+
+  function inCheckWindow(c, now, startupCutoff = c.pending?.startupCutoff) {
+    return c.precision !== 'day' && Number.isFinite(c.at) && c.at <= now && c.at >= minActivityAt(c, now, startupCutoff);
+  }
+
   function fresh() {
     return { enabled: false, generation: 0, baseline: false, rowsObservedAt: null, period: null,
       roster: null, directory: [], appliedPeriod: null, prepared: null, calendarRoster: null,
       prefetchError: '', prefetchRetryAt: 0, scheduleError: '', scheduleRetryAt: 0, scheduleReadAt: null,
-      mode: 'normal', pinnedImmediate: true, curatorName: '', startedAt: null,
+      mode: 'normal', pinnedImmediate: true, curatorName: '', startedAt: null, startupCutoff: null, headThrough: null,
       coveragePending: false, handover: null, chats: {}, dismissedFree: {}, inactiveRows: {}, offDutyReviewQueued: true };
   }
 
@@ -39,6 +59,7 @@
     s.generation++;
     s.enabled = true;
     s.startedAt = now;
+    prepareStartup(s, now);
     s.coveragePending = false;
     s.prefetchError = '';
     s.prefetchRetryAt = 0;
@@ -63,12 +84,13 @@
     Object.assign(s, fresh(), { generation, mode, pinnedImmediate, curatorName });
     return count;
   }
-  function enqueue(c, now, reason, reset = false, urgent = false) {
-    if (!inWindow(c, now)) return;
+  function enqueue(c, now, reason, reset = false, urgent = false, startupCutoff = c.pending?.startupCutoff) {
+    if (!inCheckWindow(c, now, startupCutoff)) return;
     if (!c.pending || reset) {
       c.pending = { tries: 0, due: now, reason, urgent };
       c.serial++;
     } else if (urgent) c.pending.urgent = true;
+    if (Number.isFinite(startupCutoff)) c.pending.startupCutoff = startupCutoff;
   }
   function queueSeniorBackfill(s, now) {
     if (!s.enabled || s.mode !== 'senior' || !s.roster) return;
@@ -124,7 +146,7 @@
         c.freeSince = null;
         c.status = 'Ответ не требуется';
       }
-      if (c.pending && (!inWindow(c, now) || !inWindow(c, c.pending.due))) {
+      if (c.pending && (!inCheckWindow(c, now) || !inCheckWindow(c, c.pending.due))) {
         c.pending = null;
         c.serial++;
       }
@@ -147,7 +169,7 @@
             c.reason = '';
           } else c.reason = 'Предыдущая версия проверила активность, но не сохранила итоговый статус.';
         }
-        if (checkedControl || c.pending?.reason === 'released' || (c.pending && !c.pending.tries && (hasChecked(c) || !inWindow(c, now)))) {
+        if (checkedControl || c.pending?.reason === 'released' || (c.pending && !c.pending.tries && (hasChecked(c) || !inCheckWindow(c, now)))) {
           c.pending = null;
           c.serial++;
           if (c.status === 'Ожидает пересмотра') {
@@ -206,11 +228,11 @@
         (s.prefetchRetryAt || 0) <= now && !skip.has(next)) return next;
     return null;
   }
-  function admit(c, now, reset = false, urgent = false) {
-    if (!inWindow(c, now)) return;
+  function admit(c, now, reset = false, urgent = false, startupCutoff = c.pending?.startupCutoff) {
+    if (!inCheckWindow(c, now, startupCutoff)) return;
     if (!c.checked && !c.binding && !c.transferAt) c.status = 'Новые чаты';
     const reason = c.pending?.reason === 'control' ? 'control' : 'activity';
-    enqueue(c, now, reason, reset, urgent);
+    enqueue(c, now, reason, reset, urgent, startupCutoff);
   }
   function activateRoster(s, data, now) {
     const transition = s.appliedPeriod !== s.period;
@@ -482,7 +504,7 @@
     if (value === false) c.rowAssignment = c.panelAssignment = false;
     c.assignedToSelf = Boolean(c.rowAssignment || c.panelAssignment);
   }
-  function track(s, row, now, removed) {
+  function track(s, row, now, removed, startupCutoff) {
     const arrived = row.precision !== 'day' && row.at >= minute(s.startedAt ?? now);
     const occurredSinceStart = Number.isFinite(s.startedAt) && (row.precision === 'exact'
       ? row.at >= s.startedAt : row.at > minute(s.startedAt));
@@ -498,14 +520,16 @@
     }
     observeAssignment(c, row.assignedToSelf, 'rowAssignment');
     put(s, c);
-    admit(c, now, false, c.unread || arrived);
+    admit(c, now, false, c.unread || arrived, startupCutoff);
     return c;
   }
-  function observe(s, rows, now, observedAt = now, { partial = false } = {}) {
-    if (!s.enabled) return;
+  function observe(s, rows, now, observedAt = now, { partial = false, startupCutoff } = {}) {
+    if (!s.enabled) return false;
     advance(s, now);
-    if (!Number.isFinite(observedAt) || observedAt > now || observedAt < (s.rowsObservedAt ?? 0)) return;
+    if (!Number.isFinite(observedAt) || observedAt > now || observedAt < (s.rowsObservedAt ?? 0)) return false;
     s.rowsObservedAt = observedAt;
+    const startup = Number.isFinite(startupCutoff);
+    const sessionMinute = minute(s.startedAt ?? now);
     for (const c of Object.values(s.chats)) {
       if (!partial) c.visible = false;
       identify(s, c, c.identity); // Includes checked fallback keys from version 1.5.
@@ -525,9 +549,12 @@
       const prior = (canonical && getChat(s, canonical)) || matching[0];
       const dismissed = prior ? null : observedMarker(s.dismissedFree, row, canonical);
       const inactive = prior ? null : observedMarker(s.inactiveRows, row, canonical);
-      if (!prior && (!inWindow(row, now) || (dismissed && !mayHaveNewActivity(dismissed, row)) ||
-          (inactive && !mayHaveNewActivity(inactive, row)))) continue;
-      let c = prior || track(s, { ...row, id: canonical || row.id }, now, inactive || dismissed);
+      const rowCutoff = startup && inCheckWindow(row, now, startupCutoff) ? startupCutoff : undefined;
+      if (startup && !Number.isFinite(rowCutoff)) continue;
+      const newOrUnread = row.at >= sessionMinute || row.unread === true;
+      if (!prior && ((!newOrUnread && !Number.isFinite(rowCutoff)) || !inCheckWindow(row, now, rowCutoff) ||
+          (dismissed && !mayHaveNewActivity(dismissed, row)) || (inactive && !mayHaveNewActivity(inactive, row)))) continue;
+      let c = prior || track(s, { ...row, id: canonical || row.id }, now, inactive || dismissed, rowCutoff);
       if (identity) c = identify(s, c, identity);
       c.rowKey = row.id; // Navigation always uses the current document's row key.
       if (Number.isInteger(row.position) && row.position > 0) c.rowPosition = row.position;
@@ -559,7 +586,8 @@
         c.signal = signal;
         c.precision = row.precision ?? 'minute';
         c.activityDirty = true;
-        if (inWindow(c, now)) admit(c, now, true, true);
+        if ((startup || newOrUnread || c.binding || c.transferAt != null || c.transferReviewAt != null) &&
+            inCheckWindow(c, now, rowCutoff)) admit(c, now, true, true, rowCutoff);
         else { c.pending = null; c.serial++; }
       } else if (row.at === c.at && signal !== null && (c.signal === null || adoptedCheckedId)) {
         if (adoptedCheckedId) c.checked.signal = signal;
@@ -570,12 +598,17 @@
         admit(c, now, !c.pending, true);
       }
       const needsReview = !hasChecked(c) || (c.checked && !Object.hasOwn(c, 'waitSince'));
-      if (!c.binding && !c.pending && needsReview) admit(c, now, false, unread);
+      if (Number.isFinite(rowCutoff) && (!c.dismissedFree || changed || newlyUnread)) {
+        admit(c, now, false, unread, rowCutoff);
+      } else if (!c.pending && needsReview && (c.binding || newOrUnread)) {
+        admit(c, now, false, unread);
+      }
     }
     if (!partial) {
       s.baseline = true;
       s.coveragePending = false;
     }
+    return true;
   }
 
   function reconcileRows(s, keys) {
@@ -605,10 +638,8 @@
   }
 
   function deadline(s, c, now) {
-    if (!c.visible || (!c.pinned && !s.roster) || !c.pending || !inWindow(c, now) || !inWindow(c, c.pending.due)) return Infinity;
-    if (c.binding && (!s.roster || (s.mode !== 'senior' && c.pending.reason !== 'control' && !canNotifyPinned(s, c)))) {
-      return Infinity;
-    }
+    if (!c.visible || ((!c.pinned || c.binding) && !s.roster) || !c.pending ||
+        !inCheckWindow(c, now) || !inCheckWindow(c, c.pending.due)) return Infinity;
     return c.pending.due;
   }
   function earliest(s, now) {
@@ -633,7 +664,8 @@
     if (!best) return null;
     const needsReplyAuthor = best.status === 'Ожидает проверки' && best.transferReviewAt == null;
     return { id: best.id, rowKey: best.rowKey || best.id, title: best.title, at: best.at, signal: best.signal, identity: best.identity, startedAt: now,
-      expiresAt: best.at + RECENT_MAX_AGE,
+      expiresAt: best.at + checkMaxAge(best, best.pending.startupCutoff),
+      minActivityAt: minActivityAt(best, now, best.pending.startupCutoff),
       position: best.rowPosition, waitKey: needsReplyAuthor ? undefined : best.waitKey, waitSince: best.waitSince,
       cursorSignal: best.cutoff?.signal, cursorKeys: best.cutoff?.keys,
       sinceAt: best.pinned ? best.cutoff?.at : undefined,
@@ -808,7 +840,7 @@
     const list = keyed(messages);
     if (new Set(list.map(m => m.key)).size !== list.length) return retry(c, 'Идентификаторы сообщений повторяются.', now);
     const last = list.at(-1);
-    if (!recent(last.at, now)) {
+    if (last.at < minActivityAt(c, now, c.pending.startupCutoff)) {
       c.pending = null;
       c.serial++;
       return [];
@@ -929,7 +961,7 @@
     // after that minute closes, even when the list publishes no new message key.
     const afterMinute = minute(last.at) + MIN;
     if ((job.signal == null || String(job.signal).startsWith('panel:')) && afterMinute > now &&
-        (!c.binding || s.mode === 'senior' || canNotifyPinned(s, c)) && (!c.pending || afterMinute < c.pending.due)) {
+        (!c.pending || afterMinute < c.pending.due)) {
       enqueue(c, afterMinute, 'minute', true);
     }
     const result = !c.dismissedFree && canNotifyPinned(s, c)
@@ -1049,11 +1081,11 @@
     return true;
   }
 
-  const api = { fresh, start, stop, finish, advance, periodAt, calendarPeriodAt, calendarSchedule,
+  const api = { fresh, start, stop, finish, advance, prepareStartup, periodAt, calendarPeriodAt, calendarSchedule,
     boundary, prefetchTime, scheduleTarget, installRoster,
     observe, reconcileRows, panelChanged, earliest, next, defer, apply, navigation,
     setMode, setPinnedInstant, dueNotices, nextNoticeAt, noticeEligible, setChatMute, unbind, isFree, freeVersion, dismissFree,
-    waitingSince, isRecentChat: inWindow };
+    waitingSince, isRecentChat: inWindow, isCheckableChat: inCheckWindow };
   globalThis.ChatEngine = api;
   if (typeof module !== 'undefined') module.exports = api;
 })();

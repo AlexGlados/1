@@ -15,7 +15,8 @@ const tabBlockLabels = {
   frozen: 'Chrome заморозил вкладку проверки. Открой её, затем вернись в рабочую вкладку.',
   discarded: 'Chrome выгрузил вкладку проверки. Открой её, затем вернись в рабочую вкладку.',
   page: 'Верни вкладку проверки на страницу чатов Школково.',
-  missing: 'Жду доступную вкладку проверки.'
+  missing: 'Жду доступную вкладку проверки.',
+  list_scan: 'Обновляю начало списка чатов.'
 };
 const clock = globalThis.ShkolkovoTime;
 const HOUR = 3_600_000;
@@ -92,7 +93,7 @@ function draw(s) {
   state = s;
   const local = clock.local();
   message('time-zone', 'Часовой пояс · ' + local.zoneLabel(Date.now()));
-  const currentWorker = s?.rulesVersion === 5;
+  const currentWorker = s?.rulesVersion === 6;
   const curatorRequired = currentWorker && s.curatorRequired === true;
   const canStart = s?.canStart ?? s?.attached;
   const status = !hasExtension ? 'Открой это меню через кнопку расширения в Chrome.'
