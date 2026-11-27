@@ -323,14 +323,23 @@ function readRecoveryRanges(value) {
   const ranges = [];
   for (const item of value) {
     if (!item || typeof item !== 'object') return null;
-    const { first, last, key } = item;
+    const { first, last, key, before, after } = item;
     if (key !== undefined && (typeof key !== 'string' || !key)) return null;
     if (first === undefined && last === undefined && key) {
+      if (before || after) return null;
       ranges.push({ key, tries: 0 });
     } else {
       if (!Number.isSafeInteger(first) || !Number.isSafeInteger(last) || first < 1 || last < first ||
           (key && first !== last)) return null;
-      ranges.push({ first, last, ...(key ? { key } : {}), tries: 0 });
+      const anchors = {};
+      for (const [side, anchor] of Object.entries({ before, after })) {
+        if (anchor === undefined || anchor === null) continue;
+        if (!Number.isSafeInteger(anchor.position) || anchor.position < 1 ||
+            (side === 'before' ? anchor.position >= first : anchor.position <= last) ||
+            typeof anchor.key !== 'string' || !anchor.key) return null;
+        anchors[side] = { position: anchor.position, key: anchor.key };
+      }
+      ranges.push({ first, last, ...(key ? { key } : {}), ...anchors, tries: 0 });
     }
   }
   return ranges;
@@ -343,14 +352,47 @@ function nextRecoveryBatch(coverage) {
   const targets = [];
   while (targets.length < RECOVERY_BATCH_SIZE && work.ranges.length) {
     const range = work.ranges[0];
-    const { first, last, key, tries } = range;
-    targets.push({ ...(first === undefined ? {} : { position: first }), ...(key ? { key } : {}), tries });
+    const { first, last, key, before, after, tries } = range;
+    targets.push({ ...(first === undefined ? {} : { position: first }), ...(key ? { key } : {}),
+      ...(before ? { before } : {}), ...(after ? { after } : {}), tries });
     if (first === last) work.ranges.shift();
     else range.first++;
   }
   if (!targets.length) return null;
   work.batch = { id: crypto.randomUUID(), cutoff: coverage.cutoff, targets };
   return work.batch;
+}
+
+function coverageIdentity(chats) {
+  const aliases = new Map();
+  for (const chat of Object.values(chats)) {
+    if (!chat.id.startsWith('id:')) continue;
+    for (const alias of [chat.rowKey, chat.fallbackKey, chat.nativeKey]) {
+      if (!alias) continue;
+      if (!aliases.has(alias)) aliases.set(alias, chat.id);
+      else if (aliases.get(alias) !== chat.id) aliases.set(alias, null);
+    }
+  }
+  return key => aliases.has(key) ? aliases.get(key) : key;
+}
+
+function countableRows(rows, cutoff, now, identify) {
+  return rows.filter(row => row && typeof row.id === 'string' && row.id &&
+    row.precision !== 'day' && Number.isFinite(row.at) && row.at > cutoff && row.at <= now)
+    .map(row => identify(row.id)).filter(Boolean);
+}
+
+function retryRecoveryTarget(ranges, target) {
+  const { position, key, before, after } = target;
+  const tail = ranges.at(-1);
+  const sameAnchor = (left, right) => left?.position === right?.position && left?.key === right?.key;
+  if (position !== undefined && !key && tail?.tries === 1 && !tail.key && tail.last + 1 === position &&
+      sameAnchor(tail.before, before) && sameAnchor(tail.after, after)) {
+    tail.last = position;
+  } else {
+    ranges.push({ ...(position === undefined ? {} : { first: position, last: position }),
+      ...(key ? { key } : {}), ...(before ? { before } : {}), ...(after ? { after } : {}), tries: 1 });
+  }
 }
 
 function applyRecoveryBatch(s, message) {
@@ -364,30 +406,48 @@ function applyRecoveryBatch(s, message) {
   const results = new Map();
   const targetKey = ({ position, key }) => JSON.stringify([position ?? null, key ?? null]);
   for (const result of message.results) {
-    if (!result || typeof result.resolved !== 'boolean') return false;
-    results.set(targetKey(result), result.resolved);
+    if (!result || typeof result.resolved !== 'boolean' ||
+        (result.resolved && (typeof result.rowId !== 'string' || !result.rowId))) return false;
+    results.set(targetKey(result), result);
   }
   if (batch.targets.some(target => !results.has(targetKey(target)))) return false;
-  const recovered = message.results.filter(result => result.resolved).length;
-  if (message.rows.length > recovered || !addRows(s, message, coverage.cutoff)) return false;
+  const earlierKeys = coverage.scannedKeys ?? Object.values(s.scan.chats)
+    .filter(chat => chat.startupQueuedCutoff === coverage.cutoff).map(chat => chat.id);
+  if (!addRows(s, message, coverage.cutoff)) return false;
+  const identify = coverageIdentity(s.scan.chats);
+  const counted = new Set(earlierKeys.map(identify).filter(Boolean));
+  work.originalKeys ??= earlierKeys;
+  const known = new Set(work.originalKeys.map(identify).filter(Boolean));
+  const oldCount = new Set(earlierKeys).size;
+  const resolvedKeys = new Set((work.resolvedKeys ?? []).map(identify).filter(Boolean));
+  let recovered = 0;
   for (const target of batch.targets) {
-    if (results.get(targetKey(target)) || target.tries > 0) continue;
-    const { position, key } = target;
-    const tail = work.ranges.at(-1);
-    if (position !== undefined && !key && tail?.tries === 1 && !tail.key && tail.last + 1 === position) {
-      tail.last = position;
+    const result = results.get(targetKey(target));
+    const rowId = result.resolved ? identify(result.rowId) : null;
+    const matches = rowId && (target.key ? identify(target.key) === rowId
+      : (target.before || target.after) && !known.has(rowId));
+    if (matches && !resolvedKeys.has(rowId)) {
+      resolvedKeys.add(rowId);
+      recovered++;
     } else {
-      work.ranges.push({ ...(position === undefined ? {} : { first: position, last: position }),
-        ...(key ? { key } : {}), tries: 1 });
+      if (!target.tries) retryRecoveryTarget(work.ranges, target);
     }
   }
+  for (const key of countableRows(message.rows, coverage.cutoff, Date.now(), identify)) counted.add(key);
   work.batch = null;
   work.acknowledged = message.recoveryId;
+  work.resolvedKeys = [...resolvedKeys];
+  coverage.scannedKeys = [...counted];
   coverage.skipped = Math.max(0, coverage.skipped - recovered);
-  coverage.scanned = (coverage.scanned ?? 0) + message.rows.length;
-  if (recovered) shiftLog.record(s, Date.now(), 'chat_list_reviewed', {
+  coverage.scanned = Math.max(0, (coverage.scanned ?? 0) + counted.size - oldCount);
+  if (recovered || counted.size !== oldCount) shiftLog.record(s, Date.now(), 'chat_list_reviewed', {
     complete: true, partial: coverage.partial, scanned: coverage.scanned, total: coverage.total, skipped: coverage.skipped
   });
+  if (!work.ranges.length) {
+    delete work.originalKeys;
+    delete work.resolvedKeys;
+    delete coverage.scannedKeys;
+  }
   return true;
 }
 
@@ -894,10 +954,16 @@ async function tabMessage(m, sender) {
         const reason = !complete && typeof m.reason === 'string' ? m.reason.slice(0, 200) : '';
         const trackedGaps = ranges?.reduce((total, range) => total + (range.first === undefined ? 1 : range.last - range.first + 1), 0);
         const skipped = Math.max(count(m.skipped) ?? 0, trackedGaps ?? 0);
+        const scannedKeys = hasRows
+          ? [...new Set(countableRows(m.rows, startupCutoff, Date.now(), coverageIdentity(s.scan.chats)))] : null;
+        const originalKeys = ranges?.length ? [...new Set([...scannedKeys, ...Object.values(s.scan.chats)
+          .filter(chat => chat.startupQueuedCutoff === startupCutoff).map(chat => chat.id)])] : [];
         s.coverage = {
           complete, cutoff: startupCutoff, partial: m.partial === true || skipped > 0,
-          scanned: count(m.scanned), total: count(m.total), skipped, reason,
-          ...(complete ? { recovery: { ranges, batch: null, acknowledged: null } } : {}),
+          scanned: scannedKeys?.length ?? count(m.scanned), total: count(m.total), skipped, reason,
+          ...(complete ? { scannedKeys, recovery: {
+            ranges, batch: null, acknowledged: null, originalKeys
+          } } : {}),
           retryAt: Number.isFinite(m.retryAt) ? m.retryAt : null
         };
         shiftLog.record(s, Date.now(), 'chat_list_reviewed', {

@@ -10,7 +10,7 @@
   const day = 24 * 60 * minute;
   const retryGapDelay = 7_000;
   const headRetryDelay = 5_000;
-  const latestPossibleAt = row => row.precision === 'day' ? row.at + day - 1 : row.at;
+  const latestPossibleAt = row => row.at + (row.precision === 'day' ? day - 1 : row.precision === 'minute' ? minute - 1 : 0);
   const validPage = () => /^\/chat\/?$/u.test(location.pathname);
   const pageListeners = new AbortController();
   let detached = false;
@@ -170,7 +170,8 @@
       const coverage = listCoverage(snapshot, 0, row => limit !== null && latestPossibleAt(row) < limit);
       const timed = new Set(snapshot.ordered.map(row => row.position));
       const complete = snapshot.layout
-        ? (limit === null || coverage?.complete) && rowsHavePositions(snapshot) && coversPrefix(timed, coverage?.last)
+        ? (limit === null || coverage?.complete) && rowsHavePositions(snapshot) &&
+          rememberRowOrder(snapshot, new Map(), new Map()) && coversPrefix(timed, coverage?.last)
         : snapshot.unrecognized.length === 0;
       if (!root || complete || !canInspect()) {
         void publish({ ...snapshot, headThrough: complete ? startedAt : null }, force);
@@ -191,6 +192,9 @@
     const found = new Map();
     const conflicts = new Set();
     const timed = new Set();
+    const byPosition = new Map();
+    const byKey = new Map();
+    let stable = true;
     let positioned = true;
     let complete = false;
     try {
@@ -201,6 +205,8 @@
             rememberRows(found, conflicts, frame);
             for (const row of frame.ordered) timed.add(row.position);
             positioned &&= rowsHavePositions(frame);
+            stable &&= rememberRowOrder(frame, byPosition, byKey);
+            return !stable;
           }, row => latestPossibleAt(row) < limit);
         complete = outcome.complete && positioned && coversPrefix(timed, outcome.last);
       }
@@ -214,6 +220,7 @@
         complete = rowsHavePositions(snapshot) && coversPrefix(new Set(snapshot.ordered.map(row => row.position)), coverage?.last);
       }
       rememberRows(found, conflicts, snapshot);
+      complete = complete && stable && rememberRowOrder(snapshot, byPosition, byKey);
       const rows = [...found.values()].filter(row => !conflicts.has(row.id));
       for (const row of rows) if (Number.isSafeInteger(row.position)) positions.set(row.id, row.position);
       if (activeSweep === controller) activeSweep = null;
@@ -242,6 +249,19 @@
       position > 0 && position <= frame.layout.total);
   }
 
+  function rememberRowOrder(frame, byPosition, byKey) {
+    const rowIds = new Map(frame.rows.map(row => [row.position, row.id]));
+    for (const { position, key: hint } of frame.layout?.positions ?? []) {
+      const key = hint || rowIds.get(position);
+      if (!Number.isSafeInteger(position) || position < 1 || !key) continue;
+      if ((byPosition.has(position) && byPosition.get(position) !== key) ||
+          (byKey.has(key) && byKey.get(key) !== position)) return false;
+      byPosition.set(position, key);
+      byKey.set(key, position);
+    }
+    return true;
+  }
+
   function listCoverage(frame, previousLast, pastLimit) {
     const total = frame.layout?.total;
     if (!total) return null;
@@ -256,7 +276,7 @@
       last = position;
       const row = timed.get(position);
       // An unknown timestamp cannot establish the sorted time boundary.
-      if (row && pastLimit(row)) return { last, complete: true };
+      if (row && pastLimit(row)) return { last, complete: true, timeBoundary: true };
     }
     return { last, complete: last === total };
   }
@@ -365,7 +385,7 @@
       const coverage = listCoverage(frame, last, pastLimit);
       if (!coverage) break;
       last = coverage.last;
-      if (coverage.complete) return { complete: true, last };
+      if (coverage.complete) return coverage;
       const offset = root.scrollTop;
       if (root.clientHeight <= 0) break;
       await moveList(root, offset + root.clientHeight * 0.75, signal);
@@ -391,7 +411,11 @@
     let prior = 0;
     for (const position of [...positions, last + 1]) {
       if (position > prior + 1) {
-        ranges.push({ first: prior + 1, last: position - 1 });
+        const before = keys.get(prior);
+        const after = keys.get(position);
+        ranges.push({ first: prior + 1, last: position - 1,
+          ...(before ? { before: { position: prior, key: before } } : {}),
+          ...(after ? { after: { position, key: after } } : {}) });
         skipped += position - prior - 1;
       }
       if (position <= last && !timed.has(position)) {
@@ -422,6 +446,65 @@
     }, retryGapDelay);
   }
 
+  async function recoverTarget(root, target, signal, available, capture) {
+    const deadline = Date.now() + 1_200;
+    const allowed = () => available() && Date.now() < deadline;
+    const byPosition = new Map();
+    const byKey = new Map();
+    let stable = true;
+    const inspect = () => {
+      if (!allowed()) return null;
+      const frame = capture();
+      if (frame) stable &&= rememberRowOrder(frame, byPosition, byKey);
+      return frame;
+    };
+    const atPosition = async position => {
+      if (root && Number.isSafeInteger(position) && position > 0) await showPosition(root, position, signal, allowed);
+      return inspect();
+    };
+    const nearby = async (position, done = () => false) => {
+      const frame = await atPosition(position);
+      if (!frame || !root || done(frame)) return;
+      const center = root.scrollTop;
+      for (const direction of [-1, 1]) {
+        if (!allowed()) break;
+        await moveList(root, center + direction * root.clientHeight * 0.75, signal);
+        if (done(inspect())) break;
+      }
+    };
+
+    const initial = await atPosition(target.position);
+    if (target.key) {
+      const initialMatch = initial?.rows.find(row => row.id === target.key);
+      if (initialMatch || !root) return initialMatch;
+      let match;
+      await nearby(target.position, frame => {
+        match = frame?.rows.find(row => row.id === target.key);
+        return Boolean(match);
+      });
+      return match;
+    }
+    if (!root || !initial || !Number.isSafeInteger(target.position)) return null;
+
+    const anchors = [target.before, target.after].filter(Boolean);
+    for (const anchor of anchors) {
+      if (!byKey.has(anchor.key)) await nearby(anchor.position, () => byKey.has(anchor.key));
+    }
+    const shifts = anchors.map(anchor => byKey.get(anchor.key) - anchor.position);
+    const shift = shifts[0];
+    const verified = stable && Number.isSafeInteger(shift) && shifts.every(value => value === shift) &&
+      (anchors.length === 2 || shift === 0);
+    if (!verified) {
+      // Preserve observations from the affected area, but leave the original position unresolved.
+      await nearby(target.position);
+      return null;
+    }
+    const position = target.position + shift;
+    const frame = position === target.position && initial.rows.some(row => row.position === position)
+      ? initial : await atPosition(position);
+    return stable ? frame?.rows.find(row => row.position === position) : null;
+  }
+
   async function recoverSkipped() {
     const available = () => !activeRead && !activeSweep && !navigation && canInspect();
     if (!recoveryNeeded || !available()) return;
@@ -441,20 +524,24 @@
       (!root || (root.isConnected && dom.getVirtualList?.() === root));
     const results = [];
     const rows = new Map();
+    const capture = () => {
+      if (!current()) return null;
+      const snapshot = scan();
+      if (!snapshot.ready) return null;
+      for (const row of snapshot.rows) {
+        if (row.precision !== 'day' && row.at > batch.cutoff && !ambiguous.has(row.id)) rows.set(row.id, row);
+      }
+      return snapshot;
+    };
     try {
-      for (const { position, key } of batch.targets) {
+      for (const target of batch.targets) {
         if (!current()) return;
-        if (root && Number.isSafeInteger(position)) {
-          const deadline = Date.now() + 1_200;
-          await showPosition(root, position, controller.signal, () => current() && Date.now() < deadline);
-        }
+        const { position, key } = target;
+        const row = await recoverTarget(root, target, controller.signal, current, capture);
         if (!current()) return;
-        const snapshot = scan();
-        if (!snapshot.ready) return;
-        const row = snapshot.rows.find(item => key ? item.id === key : item.position === position);
         const resolved = Boolean(row && !ambiguous.has(row.id));
-        results.push({ ...(Number.isSafeInteger(position) ? { position } : {}), ...(key ? { key } : {}), resolved });
-        if (resolved && row.precision !== 'day' && row.at > batch.cutoff) rows.set(row.id, row);
+        results.push({ ...(Number.isSafeInteger(position) ? { position } : {}), ...(key ? { key } : {}),
+          resolved, ...(resolved ? { rowId: row.id } : {}) });
       }
       if (root) await moveList(root, 0, controller.signal);
       if (!current()) return;
@@ -495,16 +582,17 @@
       const conflicts = new Set();
       const timed = new Set();
       const keys = new Map();
+      const rowPositions = new Map();
       const unrecognized = new Set();
+      let stable = true;
       const capture = async frame => {
         rememberRows(found, conflicts, frame);
         for (const row of frame.ordered) timed.add(row.position);
-        for (const { position, key } of frame.layout?.positions ?? []) {
-          if (Number.isSafeInteger(position) && key) keys.set(position, key);
-        }
+        stable &&= rememberRowOrder(frame, keys, rowPositions);
         for (const key of frame.unrecognized) unrecognized.add(key);
         const rows = frame.rows.filter(row => row.precision !== 'day' && row.at > cutoff && !conflicts.has(row.id));
         if (rows.length) await publish({ ...frame, rows });
+        return !stable;
       };
       let complete = true;
       let last = 0;
@@ -524,13 +612,14 @@
         await capture(snapshot);
       }
       if (!current()) return;
+      complete &&= stable;
       ambiguous.clear();
       for (const key of conflicts) ambiguous.add(key);
       positions.clear();
       const observedAt = Date.now();
       const rows = [...found.values()].filter(row => !ambiguous.has(row.id) && row.precision !== 'day' && row.at > cutoff);
       for (const row of rows) if (Number.isSafeInteger(row.position)) positions.set(row.id, row.position);
-      const { skipped, ranges } = recordGaps(last, timed, keys, unrecognized);
+      const { skipped, ranges } = stable ? recordGaps(last, timed, keys, unrecognized) : { skipped: null, ranges: [] };
       const result = await reportCoverage(complete, rows.length, complete ? '' : 'Не удалось завершить начальный просмотр чатов.',
         { observedAt, rows, skipped, ...(complete ? { headThrough: startedAt, recoveryRanges: ranges } : {}) });
       if (complete && result?.ok && session === startedSession) {
@@ -621,7 +710,7 @@
     return rows.find(row => row.key === id);
   }
 
-  async function seekRow(id, position, signal, allowed, expiresAt, minActivityAt = -Infinity, targetAt = minActivityAt) {
+  async function seekRow(id, position, signal, allowed, expiresAt, minActivityAt = -Infinity, targetAt = minActivityAt, search = null) {
     const root = dom.getVirtualList?.();
     if (!root || ambiguous.has(id)) return null;
     const alive = () => !signal.aborted && root.isConnected && allowed() && Date.now() < expiresAt;
@@ -642,10 +731,11 @@
       match = matchingRow();
       if (match) return match;
     }
-    await walkList(root, signal, alive, () => {
+    const outcome = await walkList(root, signal, alive, () => {
       match = matchingRow();
       return Boolean(match);
     }, row => latestPossibleAt(row) < targetAt);
+    if (!match && search && outcome.timeBoundary) search.reasonCode = 'row_time_boundary';
     return match;
   }
 
@@ -787,10 +877,13 @@
     const controller = new AbortController();
     activeRead = controller;
     try {
+      const search = {};
       const row = lookup(rowKey) || await seekRow(rowKey, job.position, controller.signal, allowed,
-        Math.min(expiresAt - 750, Date.now() + 10_000), minActivityAt, Math.max(minActivityAt, job.at ?? minActivityAt));
+        Math.min(expiresAt - 750, Date.now() + 10_000), minActivityAt, Math.max(minActivityAt, job.at ?? minActivityAt), search);
       if (!row || !row.element.isConnected) {
-        return fail('row_unavailable', 'Строка чата недоступна.', controller.signal.aborted || !allowed());
+        const reasonCode = search.reasonCode ?? 'row_unavailable';
+        const reason = reasonCode === 'row_time_boundary' ? 'Достигнута граница времени поиска.' : 'Строка чата недоступна.';
+        return fail(reasonCode, reason, controller.signal.aborted || !allowed());
       }
       if (controller.signal.aborted || !allowed() || !Number.isFinite(row.at) ||
           latestPossibleAt(row) < minActivityAt) return fail('row_unavailable', 'Чат вышел из окна проверки или вкладка занята.', true);

@@ -8,7 +8,7 @@
   const STARTUP_MAX_AGE = 45 * MIN;
   const WAIT_MAX_AGE = 12 * HOUR;
   const READ_FAILURE_CODES = new Set([
-    'row_unavailable', 'history_unconfirmed', 'panel_changed', 'read_error', 'tab_no_response'
+    'row_unavailable', 'row_time_boundary', 'history_unconfirmed', 'panel_changed', 'read_error', 'tab_no_response'
   ]);
   const minute = at => Math.floor(at / MIN) * MIN;
   // Moscow is UTC+3, an integral number of hours. Epoch-hour boundaries coincide.

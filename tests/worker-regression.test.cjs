@@ -12,6 +12,7 @@ const CHAT_URL = 'https://1.shkolkovo.online/chat';
 const TASK_ALARM = 'shkolkovo.tasks';
 const ORIGIN = 'chrome-extension://regression/';
 const START = Date.UTC(2026, 10, 27, 10, 18);
+const { version } = require('../chrome/manifest.json');
 const event = () => ({ addListener(listener) { this.emit = listener; } });
 
 async function settle() {
@@ -49,7 +50,7 @@ function fixture() {
     };
   }
   const chrome = {
-    runtime: { id: 'regression', getManifest: () => ({ version: '1.11.1' }), getURL: file => ORIGIN + file,
+    runtime: { id: 'regression', getManifest: () => ({ version }), getURL: file => ORIGIN + file,
       onMessage: event(), onInstalled: event(), onStartup: event() },
     storage: { local: storage(values), session: storage(session) },
     alarms: {
@@ -223,13 +224,14 @@ test('recognized rows are read before startup completes and a later replay does 
   await settle();
   assert.deepEqual(f.reads, ['recognized']);
   assert.equal((await f.report({ complete: true, partial: true, skipped: 1, scanned: 1, rows,
-    recoveryRanges: [{ first: 2, last: 2 }] })).ok, true);
+    recoveryRanges: [{ first: 2, last: 2, before: { position: 1, key: 'recognized' } }] })).ok, true);
   await f.plan();
   await settle();
   assert.deepEqual(f.reads, ['recognized']);
   assert.match((await f.popup('ui:status')).scanStatus, /— 1/);
   const { recovery } = await f.recovery();
-  assert.equal((await f.report({ recovery: true, recoveryId: recovery.id, results: [{ position: 2, resolved: true }],
+  assert.equal((await f.report({ recovery: true, recoveryId: recovery.id,
+    results: [{ position: 2, resolved: true, rowId: 'recovered' }],
     rows: [{ id: 'recovered', title: 'Fixture', at: START - 35 * MINUTE, precision: 'minute' }] })).ok, true);
   await f.plan();
   await settle();
@@ -240,7 +242,8 @@ test('all 181 skipped positions receive a bounded attempt and an in-flight batch
   const f = fixture();
   f.state.scan.startupCutoff = START - 45 * MINUTE;
   assert.equal((await f.report({ complete: true, partial: true, skipped: 181, scanned: 0, rows: [],
-    recoveryRanges: [{ first: 2, last: 182 }] })).ok, true);
+    recoveryRanges: [{ first: 2, last: 182, before: { position: 1, key: 'before' },
+      after: { position: 183, key: 'after' } }] })).ok, true);
   const first = (await f.recovery()).recovery;
   assert.equal(first.targets.length, 8);
   assert.equal(first.targets[0].position, 2);
@@ -250,7 +253,7 @@ test('all 181 skipped positions receive a bounded attempt and an in-flight batch
   let batch = first;
   while (batch) {
     assert.ok(batch.targets.length <= 8);
-    const results = batch.targets.map(({ position }) => ({ position, resolved: position !== 2 }));
+    const results = batch.targets.map(({ position }) => ({ position, resolved: position !== 2, rowId: 'row-' + position }));
     attempted.push(...results.map(result => result.position));
     const report = { recovery: true, recoveryId: batch.id, results, rows: [] };
     assert.equal((await f.report(report)).ok, true);
@@ -260,6 +263,47 @@ test('all 181 skipped positions receive a bounded attempt and an in-flight batch
   }
   assert.deepEqual(attempted, [...Array.from({ length: 181 }, (_, index) => index + 2), 2]);
   assert.equal(f.saved().coverage.skipped, 1);
+});
+
+test('a known chat moved into a skipped position does not resolve the gap or increase coverage', async () => {
+  const f = fixture();
+  f.state.scan.startupCutoff = START - 45 * MINUTE;
+  const known = { id: 'known', title: 'Known', at: START - 5 * MINUTE, precision: 'minute', position: 1 };
+  assert.equal((await f.report({ complete: true, partial: true, skipped: 1, rows: [known],
+    recoveryRanges: [{ first: 2, last: 2, before: { position: 1, key: known.id },
+      after: { position: 3, key: 'after' } }] })).ok, true);
+  let batch = (await f.recovery()).recovery;
+  assert.equal(batch.targets[0].before.key, known.id);
+  assert.equal((await f.report({ recovery: true, recoveryId: batch.id,
+    results: [{ position: 2, resolved: true, rowId: known.id }], rows: [{ ...known, position: 2 }] })).ok, true);
+  assert.equal(f.saved().coverage.scanned, 1);
+  assert.equal(f.saved().coverage.skipped, 1);
+  batch = (await f.recovery()).recovery;
+  assert.equal(batch.targets[0].after.key, 'after');
+  const recovered = { ...known, id: 'recovered', position: 2 };
+  assert.equal((await f.report({ recovery: true, recoveryId: batch.id,
+    results: [{ position: 2, resolved: true, rowId: recovered.id }], rows: [known, recovered, recovered] })).ok, true);
+  assert.equal(f.saved().coverage.scanned, 2);
+  assert.equal(f.saved().coverage.skipped, 0);
+});
+
+test('a newly discovered chat is counted once and resolves a gap when its anchors later match', async () => {
+  const f = fixture();
+  f.state.scan.startupCutoff = START - 45 * MINUTE;
+  const row = { id: 'new', title: 'New', at: START - 5 * MINUTE, precision: 'minute', position: 2 };
+  assert.equal((await f.report({ complete: true, partial: true, skipped: 1, rows: [],
+    recoveryRanges: [{ first: 2, last: 2, before: { position: 1, key: 'before' },
+      after: { position: 3, key: 'after' } }] })).ok, true);
+  let batch = (await f.recovery()).recovery;
+  assert.equal((await f.report({ recovery: true, recoveryId: batch.id,
+    results: [{ position: 2, resolved: false }], rows: [row] })).ok, true);
+  assert.equal(f.saved().coverage.scanned, 1);
+  assert.equal(f.saved().coverage.skipped, 1);
+  batch = (await f.recovery()).recovery;
+  assert.equal((await f.report({ recovery: true, recoveryId: batch.id,
+    results: [{ position: 2, resolved: true, rowId: row.id }], rows: [row] })).ok, true);
+  assert.equal(f.saved().coverage.scanned, 1);
+  assert.equal(f.saved().coverage.skipped, 0);
 });
 
 test('a rejected ready history logs a reason code without the chat or message metadata', async () => {
@@ -275,6 +319,18 @@ test('a rejected ready history logs a reason code without the chat or message me
   assert.equal(failure.details.reason, 'message_id_missing');
   assert.deepEqual(Object.keys(failure.details), ['reason']);
   assert.equal(f.saved().checked, 0);
+});
+
+test('stopping the targeted search at the time boundary has a distinct journal code', async () => {
+  const f = fixture();
+  f.state.scan.startupCutoff = START - 45 * MINUTE;
+  f.controls.read = () => ({ ready: false, reasonCode: 'row_time_boundary' });
+  await f.report({ complete: true, partial: true, recoveryRanges: [],
+    rows: [{ id: 'target', title: 'Fixture title', at: START - 5 * MINUTE, precision: 'minute' }] });
+  await f.plan();
+  await settle();
+  const failure = f.saved().shiftLogs.active.events.find(event => event.event === 'chat_check_failed');
+  assert.equal(failure.details.reason, 'row_time_boundary');
 });
 
 test('failed manual starts remove only the tabs the attempts created', async () => {
