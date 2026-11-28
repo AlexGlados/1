@@ -8,7 +8,20 @@ const connectionLabels = {
   online: 'Платформа в сети', connecting: 'Платформа подключается',
   offline: 'Платформа не в сети', unknown: 'Статус неизвестен'
 };
+const tabBlockLabels = {
+  in_use: 'Переключись на другую вкладку. Проверка продолжится в фоне.',
+  draft: 'Во вкладке проверки есть черновик или вложение.',
+  connection: 'Проверка продолжится после восстановления связи со Школково.',
+  loading: 'Жду загрузки выбранной вкладки.',
+  frozen: 'Открой вкладку проверки, затем переключись обратно.',
+  discarded: 'Открой вкладку проверки, затем переключись обратно.',
+  page: 'Обнови выбранную вкладку чатов, чтобы подключить расширение.',
+  missing: 'Открой чаты и запусти проверку из выбранной вкладки.',
+  list_scan: 'Обновляю начало списка чатов.',
+  read_busy: 'Жду завершения работы с открытым чатом.'
+};
 const clock = globalThis.ShkolkovoTime;
+const HOUR = 3_600_000;
 let state;
 let changing = false;
 let revision = 0;
@@ -82,14 +95,15 @@ function draw(s, error = '') {
   state = s;
   const local = clock.local();
   message('time-zone', 'Часовой пояс · ' + local.zoneLabel(Date.now()));
-  const currentWorker = s?.rulesVersion === 4;
+  const currentWorker = s?.rulesVersion === 9;
   const curatorRequired = currentWorker && s.curatorRequired === true;
   const canStart = s?.canStart ?? s?.attached;
   const status = !hasExtension ? 'Открой это меню через кнопку расширения в Safari.'
     : !s ? error || noResponse
     : !currentWorker ? 'Действует прежняя версия расширения. Переоткрой его меню после обновления.'
     : curatorRequired ? 'Укажи имя и фамилию куратора, как в расписании.'
-    : s.active ? (s.ready ? 'Проверка запущена в выбранной вкладке' : 'Ожидаю загрузку списка чатов')
+    : s.active ? (s.tabBlock && s.tabBlock !== 'loading' && s.scanComplete !== true ? 'Начальный просмотр приостановлен'
+      : s.ready ? 'Проверка запущена в выбранной вкладке' : 'Ожидаю загрузку списка чатов')
     : 'Открой чаты Школково и запусти проверку из этой вкладки.';
   el('status').textContent = status;
   el('curator-form').hidden = !curatorRequired;
@@ -108,19 +122,26 @@ function draw(s, error = '') {
   const conn = s?.active ? s.connection : 'unknown';
   el('connection').dataset.state = conn;
   el('connection').textContent = connectionLabels[conn] || connectionLabels.unknown;
-  el('period').textContent = s?.period || '—';
+  const range = Number.isFinite(s?.scheduleHour) ? clock.scheduleRange(s.scheduleHour) : null;
+  el('period').textContent = range?.moscow || '—';
+  message('period-local', range?.local || '');
   el('last-read').textContent = s?.lastRead || '—';
+  const pendingLogs = s?.logExport?.pending ?? 0;
+  const filename = s?.logExport?.lastExport?.filename;
+  el('export-logs').disabled = changing || !currentWorker || !pendingLogs;
+  message('log-status', [filename ? 'Сохранён в Загрузки/logs — ' + filename : 'Папка выгрузки — Загрузки/logs.',
+    pendingLogs ? 'Журналов в очереди — ' + pendingLogs + '.' : ''].filter(Boolean).join(' '));
   for (const id of ['bindings', 'uncertain', 'pending', 'checked', 'notified']) el(id).textContent = s?.[id] ?? '—';
   drawFreeList(local, s?.free);
   let schedule = '';
-  if (s?.active && s.scheduleError) {
+  if (range && s.scheduleError) {
     const reason = s.scheduleError.includes('Не удалось обновить расписание') ? s.scheduleError :
       'Не удалось обновить расписание. ' + s.scheduleError;
-    schedule = reason + '. Нужен состав на ' + s.period + '. ' + (s.retryAt ? 'Повтор в ' + s.retryAt + '.' : 'Загружаю состав.');
-  } else if (s?.active && s.prefetchError) {
-    schedule = s.prefetchError + '. Нужен состав на ' + s.nextPeriod + '.';
-  } else if (s?.loading) schedule = 'Загружаю состав на ' + s.period + '.';
-  message('note', [s?.error, schedule, s?.scanStatus, s?.reason].filter(Boolean).join(' '));
+    schedule = reason + '. Нужен состав на ' + range.moscow + '. ' + (s.retryAt ? 'Повтор в ' + s.retryAt + '.' : 'Загружаю состав.');
+  } else if (range && s.prefetchError) {
+    schedule = s.prefetchError + '. Нужен состав на ' + clock.scheduleRange(s.scheduleHour + HOUR).moscow + '.';
+  } else if (range && s.loading) schedule = 'Загружаю состав на ' + range.moscow + '.';
+  message('note', [s?.error, s?.active && tabBlockLabels[s.tabBlock], schedule, s?.scanStatus, s?.reason].filter(Boolean).join(' '));
   if (s?.result && !el('feedback').textContent) message('feedback', s.result);
 }
 async function request(message, timeoutMs) {
@@ -181,6 +202,7 @@ el('curator-form').addEventListener('submit', event => {
 el('toggle').addEventListener('click', () => command(state?.active ? 'ui:stop' : 'ui:start'));
 el('test').addEventListener('click', () => command('ui:test'));
 el('finish').addEventListener('click', () => command('ui:finish'));
+el('export-logs').addEventListener('click', () => command('ui:export-logs'));
 el('shift-chats').addEventListener('click', () => command('ui:shift'));
 el('senior').addEventListener('change', event => command('ui:settings', {
   mode: event.currentTarget.checked ? 'senior' : 'normal'

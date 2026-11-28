@@ -4,7 +4,7 @@ import UserNotifications
 
 final class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
     private enum Action: String {
-        case status, authorize, create, getAll, clear
+        case status, authorize, create, getAll, clear, exportLog
     }
 
     private enum Status: String {
@@ -84,6 +84,35 @@ final class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
                 center.removeDeliveredNotifications(withIdentifiers: [key])
                 Self.complete(context, ["ok": true, "cleared": identifiers.contains(key)])
             }
+        case .exportLog:
+            Self.exportLog(payload, context)
+        }
+    }
+
+    private static func exportLog(_ payload: [String: Any], _ context: NSExtensionContext) {
+        let filenamePattern = #"\Ashkolkovo-shift-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}\.[0-9]{3}Z-[a-f0-9]{8}\.log\z"#
+        guard let filename = payload["filename"] as? String,
+              filename.range(of: filenamePattern, options: .regularExpression) != nil,
+              let text = payload["text"] as? String, (1...2_000_000).contains(text.utf8.count) else {
+            Self.complete(context, ["ok": false, "code": "invalidRequest"])
+            return
+        }
+        do {
+            let manager = FileManager.default
+            let downloads = try manager.url(for: .downloadsDirectory, in: .userDomainMask,
+                                            appropriateFor: nil, create: false).resolvingSymlinksInPath()
+            let logs = downloads.appendingPathComponent("logs", isDirectory: true).standardizedFileURL
+            try manager.createDirectory(at: logs, withIntermediateDirectories: true)
+            let destination = logs.appendingPathComponent(filename, isDirectory: false)
+            guard logs.resolvingSymlinksInPath().path == logs.path,
+                  destination.resolvingSymlinksInPath().path == destination.path else {
+                Self.complete(context, ["ok": false, "code": "logWriteFailed"])
+                return
+            }
+            try Data(text.utf8).write(to: destination, options: .atomic)
+            Self.complete(context, ["ok": true, "filename": filename])
+        } catch {
+            Self.complete(context, ["ok": false, "code": "logWriteFailed"])
         }
     }
 

@@ -4,15 +4,23 @@
   'use strict';
   const MIN = 60_000;
   const HOUR = 60 * MIN;
-  const RECENT_MAX_AGE = 20 * MIN; // Matches the recent list limit in dom.js.
+  const RECENT_MAX_AGE = 20 * MIN; // Fresh activity for ordinary unbound reads and alerts.
+  const STARTUP_MAX_AGE = 45 * MIN;
   const WAIT_MAX_AGE = 12 * HOUR;
+  const READ_FAILURE_CODES = new Set([
+    'row_unavailable', 'row_range_unavailable', 'row_time_boundary', 'history_unconfirmed', 'panel_changed',
+    'read_error', 'tab_no_response'
+  ]);
   const minute = at => Math.floor(at / MIN) * MIN;
+  const latestPossibleAt = ({ at, precision }) => precision === 'day' ? new Date(at).setHours(24, 0, 0, 0) - 1
+    : at + (precision === 'minute' ? MIN - 1 : 0);
   // Moscow is UTC+3, an integral number of hours. Epoch-hour boundaries coincide.
   const calendarPeriodAt = now => Math.floor(now / HOUR) * HOUR;
   const periodAt = now => calendarPeriodAt(now + 5 * MIN);
   const boundary = (now, s) => (s?.period ?? periodAt(now)) + 55 * MIN;
   const prefetchTime = (now, s) => boundary(now, s) - MIN;
-  const freshlyPrepared = (s, period) => s.prepared?.period === period && s.prepared.readAt >= period - 6 * MIN;
+  const freshlyPrepared = (s, period) => s.prepared?.period === period &&
+    Array.isArray(s.prepared.names) && s.prepared.readAt >= period - 6 * MIN;
   function inWindow(c, now) {
     return c.precision !== 'day' && recent(c.at, now);
   }
@@ -27,11 +35,36 @@
   }
   const hasChecked = c => c.checked && c.checked.at === c.at && c.checked.signal === c.signal;
 
+  function prepareStartup(s, now) {
+    s.startupCutoff = now - STARTUP_MAX_AGE;
+    s.headThrough = null;
+    s.rowsObservedAt = null;
+    s.baseline = false;
+  }
+
+  function checkMaxAge(c, startupCutoff) {
+    return Number.isFinite(startupCutoff) || c.binding || c.pinnedColleague || c.unread ? WAIT_MAX_AGE : RECENT_MAX_AGE;
+  }
+
+  function minActivityAt(c, now, startupCutoff) {
+    return Math.max(now - checkMaxAge(c, startupCutoff), startupCutoff ?? -Infinity) + 1;
+  }
+
+  function isStartupActivity(row, cutoff) {
+    return row.precision !== 'day' && Number.isFinite(row.at) && latestPossibleAt(row) > cutoff;
+  }
+
+  function inCheckWindow(c, now, startupCutoff = c.pending?.startupCutoff) {
+    if (c.precision === 'day' || !Number.isFinite(c.at) || c.at > now ||
+        c.at < now - checkMaxAge(c, startupCutoff) + 1) return false;
+    return !Number.isFinite(startupCutoff) || isStartupActivity(c, startupCutoff);
+  }
+
   function fresh() {
     return { enabled: false, generation: 0, baseline: false, rowsObservedAt: null, period: null,
-      roster: null, directory: [], appliedPeriod: null, prepared: null, calendarRoster: null,
+      roster: null, directory: [], appliedPeriod: null, appliedRosterKey: null, prepared: null, calendarRoster: null,
       prefetchError: '', prefetchRetryAt: 0, scheduleError: '', scheduleRetryAt: 0, scheduleReadAt: null,
-      mode: 'normal', pinnedImmediate: true, curatorName: '', startedAt: null,
+      mode: 'normal', pinnedImmediate: true, curatorName: '', startedAt: null, startupCutoff: null, headThrough: null,
       coveragePending: false, handover: null, chats: {}, dismissedFree: {}, inactiveRows: {}, offDutyReviewQueued: true };
   }
 
@@ -39,6 +72,7 @@
     s.generation++;
     s.enabled = true;
     s.startedAt = now;
+    prepareStartup(s, now);
     s.coveragePending = false;
     s.prefetchError = '';
     s.prefetchRetryAt = 0;
@@ -63,12 +97,13 @@
     Object.assign(s, fresh(), { generation, mode, pinnedImmediate, curatorName });
     return count;
   }
-  function enqueue(c, now, reason, reset = false, urgent = false) {
-    if (!inWindow(c, now)) return;
+  function enqueue(c, now, reason, reset = false, urgent = false, startupCutoff = c.pending?.startupCutoff) {
+    if (!inCheckWindow(c, now, startupCutoff)) return;
     if (!c.pending || reset) {
       c.pending = { tries: 0, due: now, reason, urgent };
       c.serial++;
     } else if (urgent) c.pending.urgent = true;
+    if (Number.isFinite(startupCutoff)) c.pending.startupCutoff = startupCutoff;
   }
   function queueSeniorBackfill(s, now) {
     if (!s.enabled || s.mode !== 'senior' || !s.roster) return;
@@ -79,7 +114,7 @@
     }
   }
   function queueOffDutyReview(s, now) {
-    if (s.offDutyReviewQueued || !Array.isArray(s.roster) || !s.roster.length || s.appliedPeriod !== s.period) return;
+    if (s.offDutyReviewQueued || !Array.isArray(s.roster) || s.appliedPeriod !== s.period) return;
     s.offDutyReviewQueued = true;
     // Version 1.7.2 did not keep the reply author in ordinary chat records.
     // Read only recent, confirmed waits affected by the former two-hour rule.
@@ -108,8 +143,9 @@
       if (Math.max(removed.at, removed.rowAt) <= now - RECENT_MAX_AGE) delete s.inactiveRows[id];
     }
     for (const c of Object.values(s.chats)) {
-      if (tooOld(c.lastStudentAt, now) && tooOld(c.at, now) &&
-          (!Number.isFinite(c.lastMessageAt) || tooOld(c.lastMessageAt, now))) {
+      const lastActivity = Math.max(...[c.at, c.lastMessageAt, c.lastParticipantAt, c.lastStudentAt, c.lastReplyAt,
+        c.waitSince, c.binding?.replyAt, c.pinnedColleague?.replyAt].filter(Number.isFinite));
+      if (tooOld(lastActivity, now)) {
         delete s.chats[c.id];
         continue;
       }
@@ -124,7 +160,7 @@
         c.freeSince = null;
         c.status = 'Ответ не требуется';
       }
-      if (c.pending && (!inWindow(c, now) || !inWindow(c, c.pending.due))) {
+      if (c.pending && (!inCheckWindow(c, now) || !inCheckWindow(c, c.pending.due))) {
         c.pending = null;
         c.serial++;
       }
@@ -147,7 +183,7 @@
             c.reason = '';
           } else c.reason = 'Предыдущая версия проверила активность, но не сохранила итоговый статус.';
         }
-        if (checkedControl || c.pending?.reason === 'released' || (c.pending && !c.pending.tries && (hasChecked(c) || !inWindow(c, now)))) {
+        if (checkedControl || c.pending?.reason === 'released' || (c.pending && !c.pending.tries && (hasChecked(c) || !inCheckWindow(c, now)))) {
           c.pending = null;
           c.serial++;
           if (c.status === 'Ожидает пересмотра') {
@@ -166,7 +202,7 @@
     if (s.appliedPeriod == null && s.roster) s.appliedPeriod = previous;
     if (previous === calendar) {
       // The previous roster is still the calendar-hour schedule until :00.
-      s.calendarRoster = { period: previous, names: s.roster, readAt: s.scheduleReadAt,
+      s.calendarRoster = { period: previous, names: s.roster, directory: s.directory, readAt: s.scheduleReadAt,
         error: s.scheduleError, retryAt: s.scheduleRetryAt };
     }
     s.period = periodAt(now);
@@ -189,11 +225,11 @@
   function calendarSchedule(s, now) {
     const period = calendarPeriodAt(now);
     if (s.period === period) {
-      return { period, loaded: Boolean(s.roster?.length), readAt: s.scheduleReadAt ?? null,
+      return { period, loaded: Array.isArray(s.roster), readAt: s.scheduleReadAt ?? null,
         error: s.scheduleError || '', retryAt: s.scheduleRetryAt || 0 };
     }
     const cached = s.calendarRoster?.period === period ? s.calendarRoster : null;
-    return { period, loaded: Boolean(cached?.names?.length), readAt: cached?.readAt ?? null,
+    return { period, loaded: Array.isArray(cached?.names), readAt: cached?.readAt ?? null,
       error: cached?.error || '', retryAt: cached?.retryAt || 0 };
   }
   function scheduleTarget(s, now, skip = new Set()) {
@@ -206,25 +242,29 @@
         (s.prefetchRetryAt || 0) <= now && !skip.has(next)) return next;
     return null;
   }
-  function admit(c, now, reset = false, urgent = false) {
-    if (!inWindow(c, now)) return;
+  function admit(c, now, reset = false, urgent = false, startupCutoff = c.pending?.startupCutoff) {
+    if (!inCheckWindow(c, now, startupCutoff)) return;
     if (!c.checked && !c.binding && !c.transferAt) c.status = 'Новые чаты';
     const reason = c.pending?.reason === 'control' ? 'control' : 'activity';
-    enqueue(c, now, reason, reset, urgent);
+    enqueue(c, now, reason, reset, urgent, startupCutoff);
+    if (Number.isFinite(startupCutoff)) c.startupQueuedCutoff = startupCutoff;
   }
   function activateRoster(s, data, now) {
     const transition = s.appliedPeriod !== s.period;
+    const rosterKey = data.names.map(normal).sort().join('\n');
+    const reconcile = transition || s.appliedRosterKey !== rosterKey;
     s.roster = data.names;
     s.directory = data.directory;
     s.appliedPeriod = s.period;
+    s.appliedRosterKey = rosterKey;
     s.scheduleReadAt = data.readAt;
     s.scheduleError = '';
     s.scheduleRetryAt = 0;
     if (!handoverAllowed(s, now)) s.handover = null;
-    const boundaryAt = s.period - 5 * MIN;
+    const releaseAt = transition ? s.period - 5 * MIN : now;
     for (const c of Object.values(s.chats)) {
       if (!c.binding && c.pinnedColleague) c.binding = { id: c.id, ...c.pinnedColleague };
-      if (c.binding && transition) {
+      if (c.binding && reconcile) {
         const name = s.roster.find(n => normal(n) === normal(c.binding.curator));
         if (name) {
           c.binding.curator = name;
@@ -235,7 +275,7 @@
         } else {
           c.transferReplyAt = c.lastReplyAt ?? c.binding.replyAt;
           c.binding = c.pinnedColleague = null;
-          c.transferReviewAt = inWindow(c, now) ? boundaryAt : null;
+          c.transferReviewAt = inWindow(c, now) ? releaseAt : null;
           c.transferReplyKey = c.lastReplyKey ?? null;
           c.transferAt = c.freeSince = null;
           c.status = c.transferReviewAt == null ? 'Ответ не требуется' : 'Ожидает проверки';
@@ -264,7 +304,7 @@
     const calendarOnly = !effective && ticket.period === calendarPeriodAt(now);
     const ahead = ticket.period === s.period + HOUR && now >= prefetchTime(now, s);
     if (!s.enabled || ticket.generation !== s.generation || !(effective || calendarOnly || ahead)) return false;
-    if (error || !Array.isArray(names) || !names.length || names.some(n => typeof n !== 'string' || !words(n).length)) {
+    if (error || !Array.isArray(names) || names.some(n => typeof n !== 'string' || !words(n).length)) {
       const why = 'Не удалось обновить расписание: ' + (error || 'на нужный час не удалось прочитать состав.');
       if (ahead && !freshlyPrepared(s, ticket.period)) {
         s.prefetchError = why;
@@ -285,7 +325,7 @@
       s.prefetchError = '';
       s.prefetchRetryAt = 0;
     } else if (calendarOnly) {
-      s.calendarRoster = { period: ticket.period, names: roster, readAt: now, error: '', retryAt: 0 };
+      s.calendarRoster = { ...data, error: '', retryAt: 0 };
     } else {
       activateRoster(s, data, now);
     }
@@ -317,9 +357,7 @@
     return aKey !== '' && aKey === key(b ?? '');
   }
   function handoverAllowed(s, now) {
-    if (s.appliedPeriod !== s.period || s.period !== periodAt(now) || !Array.isArray(s.roster)) return false;
-    const ownName = configuredCurator(s);
-    return s.roster.some(name => sameCurator(name, ownName));
+    return s.appliedPeriod === s.period && s.period === periodAt(now) && curatorDuty(s, s.roster, s.directory) === true;
   }
   function compatible(a, b) {
     const x = bare(a), y = bare(b);
@@ -352,10 +390,20 @@
   function knownCurators(s) {
     return [...(s.roster || []), ...(s.directory || [])];
   }
-  function configuredCurator(s) {
+  function configuredCuratorMatch(s, names) {
     // Prefer the same registered name. When the settings omit a patronymic,
     // both recorded name parts must identify exactly one directory entry.
-    return nameMatch(s.curatorName, knownCurators(s), (a, b) => bare(a) === bare(b)).name;
+    return nameMatch(s.curatorName, names, (a, b) => bare(a) === bare(b));
+  }
+  function configuredCurator(s) {
+    return configuredCuratorMatch(s, knownCurators(s)).name;
+  }
+  function curatorDuty(s, names, directory = []) {
+    if (!Array.isArray(names)) return null;
+    if (!names.length) return false;
+    const match = configuredCuratorMatch(s, [...names, ...(directory || [])]);
+    if (match.uncertain) return null;
+    return names.some(name => sameCurator(name, match.name));
   }
 
   function getChat(s, id) {
@@ -471,8 +519,8 @@
       ...(ambiguous ? { requireSelectedIdentity: true } : {}) };
   }
   function cursor(at, signal, precision, now) {
-    // A date-only list row bounds the old tail somewhere within that Moscow day.
-    const floor = precision === 'day' ? Math.min(now, at + 24 * HOUR - 1) : at;
+    // A date-only list row bounds the old tail somewhere within that local day.
+    const floor = precision === 'day' ? Math.min(now, latestPossibleAt({ at, precision })) : at;
     return { at: floor, keys: null, signal };
   }
   function observeAssignment(c, value, source) {
@@ -482,7 +530,7 @@
     if (value === false) c.rowAssignment = c.panelAssignment = false;
     c.assignedToSelf = Boolean(c.rowAssignment || c.panelAssignment);
   }
-  function track(s, row, now, removed) {
+  function track(s, row, now, removed, startupCutoff) {
     const arrived = row.precision !== 'day' && row.at >= minute(s.startedAt ?? now);
     const occurredSinceStart = Number.isFinite(s.startedAt) && (row.precision === 'exact'
       ? row.at >= s.startedAt : row.at > minute(s.startedAt));
@@ -498,14 +546,16 @@
     }
     observeAssignment(c, row.assignedToSelf, 'rowAssignment');
     put(s, c);
-    admit(c, now, false, c.unread || arrived);
+    admit(c, now, false, c.unread || arrived, startupCutoff);
     return c;
   }
-  function observe(s, rows, now, observedAt = now, { partial = false } = {}) {
-    if (!s.enabled) return;
+  function observe(s, rows, now, observedAt = now, { partial = false, startupCutoff } = {}) {
+    if (!s.enabled) return false;
     advance(s, now);
-    if (!Number.isFinite(observedAt) || observedAt > now || observedAt < (s.rowsObservedAt ?? 0)) return;
+    if (!Number.isFinite(observedAt) || observedAt > now || observedAt < (s.rowsObservedAt ?? 0)) return false;
     s.rowsObservedAt = observedAt;
+    const startup = Number.isFinite(startupCutoff);
+    const sessionMinute = minute(s.startedAt ?? now);
     for (const c of Object.values(s.chats)) {
       if (!partial) c.visible = false;
       identify(s, c, c.identity); // Includes checked fallback keys from version 1.5.
@@ -525,9 +575,12 @@
       const prior = (canonical && getChat(s, canonical)) || matching[0];
       const dismissed = prior ? null : observedMarker(s.dismissedFree, row, canonical);
       const inactive = prior ? null : observedMarker(s.inactiveRows, row, canonical);
-      if (!prior && (!inWindow(row, now) || (dismissed && !mayHaveNewActivity(dismissed, row)) ||
-          (inactive && !mayHaveNewActivity(inactive, row)))) continue;
-      let c = prior || track(s, { ...row, id: canonical || row.id }, now, inactive || dismissed);
+      const rowCutoff = startup && inCheckWindow(row, now, startupCutoff) ? startupCutoff : undefined;
+      if (startup && !Number.isFinite(rowCutoff)) continue;
+      const newOrUnread = row.at >= sessionMinute || row.unread === true;
+      if (!prior && ((!newOrUnread && !Number.isFinite(rowCutoff)) || !inCheckWindow(row, now, rowCutoff) ||
+          (dismissed && !mayHaveNewActivity(dismissed, row)) || (inactive && !mayHaveNewActivity(inactive, row)))) continue;
+      let c = prior || track(s, { ...row, id: canonical || row.id }, now, inactive || dismissed, rowCutoff);
       if (identity) c = identify(s, c, identity);
       c.rowKey = row.id; // Navigation always uses the current document's row key.
       if (Number.isInteger(row.position) && row.position > 0) c.rowPosition = row.position;
@@ -559,7 +612,8 @@
         c.signal = signal;
         c.precision = row.precision ?? 'minute';
         c.activityDirty = true;
-        if (inWindow(c, now)) admit(c, now, true, true);
+        if ((startup || newOrUnread || c.binding || c.transferAt != null || c.transferReviewAt != null) &&
+            inCheckWindow(c, now, rowCutoff)) admit(c, now, true, true, rowCutoff);
         else { c.pending = null; c.serial++; }
       } else if (row.at === c.at && signal !== null && (c.signal === null || adoptedCheckedId)) {
         if (adoptedCheckedId) c.checked.signal = signal;
@@ -570,12 +624,18 @@
         admit(c, now, !c.pending, true);
       }
       const needsReview = !hasChecked(c) || (c.checked && !Object.hasOwn(c, 'waitSince'));
-      if (!c.binding && !c.pending && needsReview) admit(c, now, false, unread);
+      if (Number.isFinite(rowCutoff) && (c.startupQueuedCutoff !== rowCutoff || changed || newlyUnread) &&
+          (!c.dismissedFree || changed || newlyUnread)) {
+        admit(c, now, false, unread, rowCutoff);
+      } else if (!c.pending && needsReview && (c.binding || newOrUnread)) {
+        admit(c, now, false, unread);
+      }
     }
     if (!partial) {
       s.baseline = true;
       s.coveragePending = false;
     }
+    return true;
   }
 
   function reconcileRows(s, keys) {
@@ -605,10 +665,8 @@
   }
 
   function deadline(s, c, now) {
-    if (!c.visible || (!c.pinned && !s.roster) || !c.pending || !inWindow(c, now) || !inWindow(c, c.pending.due)) return Infinity;
-    if (c.binding && (!s.roster || (s.mode !== 'senior' && c.pending.reason !== 'control' && !canNotifyPinned(s, c)))) {
-      return Infinity;
-    }
+    if (!c.visible || ((!c.pinned || c.binding) && !s.roster) || !c.pending ||
+        !inCheckWindow(c, now) || !inCheckWindow(c, c.pending.due)) return Infinity;
     return c.pending.due;
   }
   function earliest(s, now) {
@@ -633,7 +691,8 @@
     if (!best) return null;
     const needsReplyAuthor = best.status === 'Ожидает проверки' && best.transferReviewAt == null;
     return { id: best.id, rowKey: best.rowKey || best.id, title: best.title, at: best.at, signal: best.signal, identity: best.identity, startedAt: now,
-      expiresAt: best.at + RECENT_MAX_AGE,
+      expiresAt: best.at + checkMaxAge(best, best.pending.startupCutoff),
+      minActivityAt: minActivityAt(best, now, best.pending.startupCutoff),
       position: best.rowPosition, waitKey: needsReplyAuthor ? undefined : best.waitKey, waitSince: best.waitSince,
       cursorSignal: best.cutoff?.signal, cursorKeys: best.cutoff?.keys,
       sinceAt: best.pinned ? best.cutoff?.at : undefined,
@@ -727,7 +786,9 @@
     const continuing = waitIndex >= 0 && waitIndex > replyIndex;
     const atStart = h.startReached === true || (h.startReached === undefined && h.complete === true);
     const last = messages.at(-1);
-    if (afterReply.some(m => !knownRole(m))) return { reason: 'Не удалось однозначно определить автора сообщения.' };
+    if (afterReply.some(m => !knownRole(m))) {
+      return { reasonCode: 'message_author_unknown', reason: 'Не удалось однозначно определить автора сообщения.' };
+    }
     const first = afterReply.find(asks);
     const needsHistory = (first || c.waitKey) && !reply && !atStart && !continuing;
     let wait = continuing && !reply && !atStart ? messages[waitIndex] : first;
@@ -737,7 +798,9 @@
         // in an otherwise verified tail gives a conservative new baseline.
         wait = afterReply.find(message => asks(message) && now - message.at <= RECENT_MAX_AGE);
       } else wait = null;
-      if (!wait) return { reason: 'Не подтверждено начало истории или последний ответ куратора.' };
+      if (!wait) {
+        return { reasonCode: 'history_anchor_missing', reason: 'Не подтверждено начало истории или последний ответ куратора.' };
+      }
     } else if (tooOld(wait?.at, now)) {
       const confirmed = continuing && messages[waitIndex];
       // Keep a replacement already confirmed for this unanswered episode.
@@ -757,10 +820,12 @@
     const baselineOnly = !floor.keys && last.at <= floor.at && anchor < 0;
     if (messages[0].at >= floor.at && !baselineOnly && anchor < 0 && !h.startReached && !h.sinceCovered &&
         !(h.complete && h.startReached === undefined)) {
-      return { reason: 'Не загрузились сообщения до предыдущей проверки закреплённого чата.' };
+      return { reasonCode: 'pinned_history_incomplete', reason: 'Не загрузились сообщения до предыдущей проверки закреплённого чата.' };
     }
     const freshMessages = anchor >= 0 ? messages.slice(anchor + 1) : messages.filter(m => m.at > floor.at);
-    if (freshMessages.some(m => !knownRole(m))) return { reason: 'Не удалось определить автора сообщения в закреплённом чате.' };
+    if (freshMessages.some(m => !knownRole(m))) {
+      return { reasonCode: 'message_author_unknown', reason: 'Не удалось определить автора сообщения в закреплённом чате.' };
+    }
     return freshMessages.filter(m => m.role === 'student');
   }
   function canRebind(c, messages) {
@@ -782,43 +847,100 @@
     return { kind, phase, id: c.id, title: c.title, at, key, episode: c.waitKey,
       minutes: Math.max(0, Math.floor((now - at) / MIN)), curator: c.binding?.curator };
   }
-  function freeNotice(s, c, now) {
-    if (!isFree(c, now) || c.transferAt != null || c.freeNotifiedEpisode === c.waitKey) return null;
-    c.freeNotifiedEpisode = c.waitKey;
-    const elapsed = Math.floor((now - c.waitSince) / MIN);
-    c.remindedMinute = Math.max(c.remindedMinute || 0, dueMinute(policy(s, c, now), elapsed));
-    return notice(c, 'free', 'now', c.waitSince, c.waitKey, now);
+  function needsInitialFreeNotice(c, now) {
+    return c.transferAt == null && c.freeNotifiedEpisode !== c.waitKey && isFree(c, now);
   }
 
-  function apply(s, job, history, now) {
+  function pinnedNoticeBlock(s, c) {
+    if (!c.pinned) return 'chat_unpinned';
+    if (c.transferAt != null) return 'handover_summary';
+    if (s.pinnedImmediate === false) return 'pinned_alerts_disabled';
+    if (s.mode === 'senior' && c.muted) return 'chat_muted';
+    return 'pinned_policy';
+  }
+
+  function immediateSkipReason(s, c, last, pinMessages, now) {
+    if (c.dismissedFree) return 'chat_dismissed';
+    if (!recent(last.at, now)) return 'last_message_too_old';
+    if (c.transferAt != null) return 'handover_summary';
+    if (isFree(c, now) && c.freeNotifiedEpisode === c.waitKey) return 'episode_already_notified';
+    if ((c.binding || c.pinnedColleague) && !c.pinned && s.mode === 'normal') return 'occupied_unpinned';
+    if (isReply(last)) return 'curator_replied';
+    if (c.status === 'Ожидает расписания') return 'schedule_unconfirmed';
+    if (c.pinned) {
+      if (!canNotifyPinned(s, c)) return pinnedNoticeBlock(s, c);
+      return pinMessages.length ? 'pinned_message_too_old' : 'no_new_student_message';
+    }
+    if (!c.waitKey) return 'no_unanswered_question';
+    return c.binding || c.pinnedColleague ? 'occupied_chat' : 'chat_not_free';
+  }
+
+  function apply(s, job, history, now, check) {
     const h = history;
     let c = valid(s, job, now);
-    if (!c) return [];
-    if (!h?.ready || h.id !== c.id || !Array.isArray(h.messages) || !h.messages.length ||
-        (c.identity && c.identity !== h.identity) ||
+    if (check) {
+      const observed = c || getChat(s, job?.id);
+      Object.assign(check, { chatId: observed?.id ?? job?.id, episode: observed?.waitKey,
+        lastAt: job?.at, waitSince: observed?.waitSince, ageSource: 'list' });
+    }
+    const skip = reason => {
+      if (check) check.noticeReason = reason;
+      return [];
+    };
+    if (!c) return skip('job_stale');
+    const fail = (reasonCode, reason) => {
+      if (check) check.reasonCode = reasonCode;
+      return retry(c, reason, now);
+    };
+    const unconfirmed = 'Не подтверждены нужная переписка и загрузка истории.';
+    if (!h?.ready) {
+      const code = READ_FAILURE_CODES.has(h?.reasonCode) ? h.reasonCode : 'history_unconfirmed';
+      return fail(code, h?.reason || unconfirmed);
+    }
+    if (h.id !== c.id || (c.identity && c.identity !== h.identity) ||
         ((fallbackId(c.id) || c.id.startsWith('id:')) && !platformId(h.identity))) {
-      return retry(c, h?.reason || 'Не подтверждены нужная переписка и загрузка истории.', now);
+      return fail('chat_identity_unconfirmed', unconfirmed);
     }
     const messages = h.messages;
-    if (messages.some((m, i) => !Number.isFinite(m.at) || m.at > now || (i && messages[i - 1].at > m.at)) ||
-        minute(messages.at(-1).at) < minute(job.at)) return retry(c, 'История не соответствует последней активности.', now);
+    if (!Array.isArray(messages) || !messages.length) return fail('history_empty', unconfirmed);
+    let earliest = -Infinity;
+    if (messages.some(message => {
+      if (!Number.isFinite(message?.at) || message.at > now) return true;
+      earliest = Math.max(earliest, message.at);
+      return latestPossibleAt(message) < earliest;
+    })) {
+      return fail('message_time_invalid', 'История не соответствует последней активности.');
+    }
+    if (check) Object.assign(check, { lastAt: messages.at(-1).at, ageSource: 'history' });
+    if (minute(messages.at(-1).at) < minute(job.at)) {
+      return fail('activity_mismatch', 'История не соответствует последней активности.');
+    }
     if (platformId(h.identity) && messages.some(m => typeof m.id !== 'string' || !m.id)) {
-      return retry(c, 'Не подтверждены идентификаторы сообщений.', now);
+      return fail('message_id_missing', 'Не подтверждены идентификаторы сообщений.');
     }
     const list = keyed(messages);
-    if (new Set(list.map(m => m.key)).size !== list.length) return retry(c, 'Идентификаторы сообщений повторяются.', now);
+    if (new Set(list.map(m => m.key)).size !== list.length) {
+      return fail('message_id_duplicate', 'Идентификаторы сообщений повторяются.');
+    }
     const last = list.at(-1);
-    if (!recent(last.at, now)) {
+    const minAt = minActivityAt(c, now, c.pending.startupCutoff);
+    if (earliest < minAt) {
+      if (latestPossibleAt(last) >= minAt) {
+        return fail('message_time_unconfirmed', 'Не удалось подтвердить, что последнее сообщение попало в окно проверки.');
+      }
       c.pending = null;
       c.serial++;
-      return [];
+      return skip(recent(last.at, now) ? 'outside_check_window' : 'last_message_too_old');
     }
     if (job.signal != null && !String(job.signal).startsWith('panel:') && last.id != null && minute(last.at) === minute(job.at) &&
-        String(job.signal) !== String(last.id)) return retry(c, 'Идентификатор последнего сообщения ещё не совпал со списком.', now);
+        String(job.signal) !== String(last.id)) {
+      return fail('last_message_id_mismatch', 'Идентификатор последнего сообщения ещё не совпал со списком.');
+    }
     if (h.identity) {
       c = identify(s, c, h.identity);
       if (c.identity == null) c.identity = h.identity;
-      if (!c.pending) return [];
+      if (check) check.chatId = c.id;
+      if (!c.pending) return skip('job_stale');
     }
     const participant = list.findLast(message => message.role === 'student' || isReply(message));
     if (participant && (!Number.isFinite(c.lastParticipantAt) || participant.at > c.lastParticipantAt)) {
@@ -830,24 +952,26 @@
       s.inactiveRows ??= {};
       rememberRemoved(s.inactiveRows, c, last.at, last.key, last.id == null ? c.signal : String(last.id));
       delete s.chats[c.id];
-      return [];
+      return skip('student_inactive');
     }
     if (student && !tooOld(student.at, now) && Object.hasOwn(s.inactiveRows ?? {}, c.id)) delete s.inactiveRows[c.id];
     const facts = historyFacts(c, h, list, now);
     const pinMessages = newPinnedMessages(c, h, list);
-    if (facts.reason || pinMessages.reason) return retry(c, facts.reason || pinMessages.reason, now);
+    const failure = facts.reason ? facts : pinMessages.reason ? pinMessages : null;
+    if (failure) return fail(failure.reasonCode, failure.reason);
     const { reply, wait, lastReplyAt, lastReplyKey } = facts;
+    if (check) Object.assign(check, { episode: wait?.key, waitSince: wait?.at });
     if (student) {
       c.lastStudentKey = student.key;
       c.lastStudentAt = student.at;
     }
     if (c.pending.reason === 'off-duty-review' && !reply && h.startReached !== true) {
-      return retry(c, 'Не подтверждён автор последнего ответа куратора.', now);
+      return fail('curator_reply_unconfirmed', 'Не подтверждён автор последнего ответа куратора.');
     }
     const { curator, uncertain, offDuty } = rosterMatch(reply, s);
     const transferAt = c.transferAt ?? c.transferReviewAt;
     if (uncertain && (recentReply(reply, now) || c.binding || transferAt != null)) {
-      const notices = retry(c, 'Не удалось однозначно сопоставить куратора с расписанием.', now);
+      const notices = fail('curator_ambiguous', 'Не удалось однозначно сопоставить куратора с расписанием.');
       // A known curator role establishes a reply even if the schedule cannot
       // distinguish two people by name. Retry ownership without reviving a wait.
       if (!wait || (c.waitKey && c.waitKey !== wait.key)) {
@@ -929,25 +1053,29 @@
     // after that minute closes, even when the list publishes no new message key.
     const afterMinute = minute(last.at) + MIN;
     if ((job.signal == null || String(job.signal).startsWith('panel:')) && afterMinute > now &&
-        (!c.binding || s.mode === 'senior' || canNotifyPinned(s, c)) && (!c.pending || afterMinute < c.pending.due)) {
+        (!c.pending || afterMinute < c.pending.due)) {
       enqueue(c, afterMinute, 'minute', true);
     }
     const result = !c.dismissedFree && canNotifyPinned(s, c)
       ? pinMessages.filter(m => recent(m.at, now)).map(m => notice(c, 'pinned', 'now', m.at, m.key, now)) : [];
-    const initial = freeNotice(s, c, now);
-    if (initial) {
+    if (needsInitialFreeNotice(c, now)) {
       // The same confirmation can establish a free chat and a new pinned message.
       // Keep its waiting timestamp and send a single alert for that message.
+      const initial = notice(c, 'free', 'now', c.waitSince, c.waitKey, now);
       const duplicate = result.findIndex(n => n.key === initial.key);
       if (duplicate >= 0) result.splice(duplicate, 1);
       result.push(initial);
+    }
+    if (check) {
+      check.status = c.status;
+      if (!result.length) check.noticeReason = immediateSkipReason(s, c, last, pinMessages, now);
     }
     return result;
   }
 
   function policy(s, c, now) {
     if (c.transferAt != null || c.activityDirty || c.dismissedFree || !c.waitKey || waitingSince(c, now) === null ||
-        !recent(c.lastMessageAt, now)) return null;
+        !recent(c.lastMessageAt, now) || needsInitialFreeNotice(c, now)) return null;
     if (s.mode === 'senior') {
       if (c.binding && !c.muted) return { kind: 'senior', first: 6, every: 2 };
       if (isFree(c, now)) return { kind: 'free', first: 5, every: 2 };
@@ -1006,18 +1134,53 @@
     }
     return out;
   }
-  function noticeEligible(s, n, now) {
-    if (!s.enabled) return false;
-    if (n.kind === 'handover') return handoverAllowed(s, now) && s.handover?.period === n.episode && transfers(s, now).length > 0;
-    const c = getChat(s, n.id);
-    if (!c || c.dismissedFree || !recent(c.lastMessageAt, now)) return false;
-    if (n.phase === 'now' && n.kind === 'pinned') {
-      return canNotifyPinned(s, c) && recent(n.at, now);
+  function noticeIneligibleReason(s, n, now) {
+    if (!s.enabled) return 'monitoring_inactive';
+    if (n.kind === 'handover') {
+      if (!handoverAllowed(s, now)) return 'handover_not_allowed';
+      if (s.handover?.period !== n.episode) return 'episode_changed';
+      return transfers(s, now).length ? '' : 'handover_empty';
     }
-    if (c.activityDirty) return false;
-    if (n.phase === 'now' && n.kind === 'free') return c.transferAt == null && isFree(c, now) && c.waitKey === n.episode;
-    return c.waitKey === n.episode && policy(s, c, now)?.kind === n.kind &&
-      (n.kind !== 'senior' || c.binding?.curator === n.curator);
+    const c = getChat(s, n.id);
+    if (!c) return 'chat_unavailable';
+    if (c.dismissedFree) return 'chat_dismissed';
+    if (!recent(c.lastMessageAt, now)) return 'last_message_too_old';
+    if (n.phase === 'now' && n.kind === 'pinned') {
+      if (!canNotifyPinned(s, c)) return pinnedNoticeBlock(s, c);
+      return recent(n.at, now) ? '' : 'pinned_message_too_old';
+    }
+    if (c.activityDirty) return 'new_activity_before_send';
+    if (c.waitKey !== n.episode) {
+      return Number.isFinite(c.lastReplyAt) && c.lastReplyAt >= n.at ? 'curator_replied' : 'episode_changed';
+    }
+    if (n.phase === 'now' && n.kind === 'free') {
+      if (c.transferAt != null) return 'handover_summary';
+      if (waitingSince(c, now) === null) return 'wait_expired';
+      return isFree(c, now) ? '' : 'chat_not_free';
+    }
+    if (n.kind === 'senior' && c.muted) return 'chat_muted';
+    if (policy(s, c, now)?.kind !== n.kind) return 'reminder_policy_changed';
+    return n.kind === 'senior' && c.binding?.curator !== n.curator ? 'curator_changed' : '';
+  }
+  function noticeEligible(s, n, now) {
+    return noticeIneligibleReason(s, n, now) === '';
+  }
+  function noticeNeedsRecheck(s, n, now) {
+    if (n.kind !== 'free' || n.phase !== 'now') return false;
+    const c = getChat(s, n.id);
+    return Boolean(c?.activityDirty && c.pending && c.status === 'Свободен' && !c.binding && !c.pinnedColleague &&
+      !c.dismissedFree && c.transferAt == null && c.waitKey === n.episode && waitingSince(c, now) !== null && inWindow(c, now));
+  }
+  function noticeDelivered(s, n, now) {
+    if (n.kind !== 'free' || n.phase !== 'now') return;
+    const c = getChat(s, n.id);
+    if (!c || c.waitKey !== n.episode) return;
+    c.freeNotifiedEpisode = n.episode;
+    const p = policy(s, c, now);
+    if (p) {
+      const elapsed = Math.floor((now - c.waitSince) / MIN);
+      c.remindedMinute = Math.max(c.remindedMinute || 0, dueMinute(p, elapsed));
+    }
   }
   function setMode(s, mode, now) {
     if (!['normal', 'senior'].includes(mode)) return false;
@@ -1049,11 +1212,12 @@
     return true;
   }
 
-  const api = { fresh, start, stop, finish, advance, periodAt, calendarPeriodAt, calendarSchedule,
-    boundary, prefetchTime, scheduleTarget, installRoster,
+  const api = { fresh, start, stop, finish, advance, prepareStartup, periodAt, calendarPeriodAt, calendarSchedule,
+    boundary, prefetchTime, scheduleTarget, installRoster, curatorDuty,
     observe, reconcileRows, panelChanged, earliest, next, defer, apply, navigation,
-    setMode, setPinnedInstant, dueNotices, nextNoticeAt, noticeEligible, setChatMute, unbind, isFree, freeVersion, dismissFree,
-    waitingSince, isRecentChat: inWindow };
+    setMode, setPinnedInstant, dueNotices, nextNoticeAt, noticeEligible, noticeIneligibleReason, noticeNeedsRecheck, noticeDelivered,
+    setChatMute, unbind, isFree, freeVersion, dismissFree,
+    waitingSince, isRecentChat: inWindow, isCheckableChat: inCheckWindow, isStartupActivity };
   globalThis.ChatEngine = api;
   if (typeof module !== 'undefined') module.exports = api;
 })();

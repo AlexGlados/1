@@ -1,4 +1,5 @@
 schedule-config.json
+!/safari/WebExtension/schedule-config.json
 /firefox/dist/
 /safari/build/
 DerivedData/

@@ -4,7 +4,7 @@
   const rowPattern = /^([★☆])\s*(.+?)\s*\$(\d+)\s*((?:(?:Пн|Вт|Ср|Чт|Пт|Сб|Вс|сегодня|вчера|\d{1,2}\.\d{1,2}(?:\.\d{2,4})?)\.?[,\s]*)?\d{1,2}:\d{2}(?::\d{2})?|\d{1,2}\.\d{1,2}(?:\.\d{2,4})?)$/iu;
   const siteIdentityPattern = /^(?:[^@]{1,240})?@\s*((\d+)__(\d+)__(\d+))\s*(?:UserId:\s*\d+)?$/iu;
   const identityPattern = /^[^@]{1,240}@\s*((\d+)__(\d+)__(\d+))\s*UserId:\s*\d+$/iu;
-  const messagePattern = /^(?<author>[^@]{1,140}?)\s*@user_(?<handle>\d+)\s*(?<timestamp>(?<date>\d{2}\.\d{2}\.\d{4})\s+(?<hour>\d{1,2}):(?<minute>\d{2}))$/iu;
+  const messagePattern = /^(?<author>[^@]{1,140}?)\s*@user_(?<handle>\d+)\s*(?<timestamp>\d{1,2}\.\d{1,2}\.\d{4}\s+\d{1,2}:\d{2}(?::\d{2})?)$/iu;
   const curatorPrefix = /^(?:(?:(?:Старший|Орг|Организационный|Предметный)[\s-]+)?Куратор|Эксперт|Ментор)(?:\s*[:–—-]\s*|\s+)/iu;
   const servicePrefix = /^(?:Разработчик|Учитель|Администратор|Менеджер|Технический специалист|Техподдержка|Модератор|Поддержка)(?=[\s:–—-]|$)/iu;
   const curatorIdentity = globalThis.ShkolkovoIdentity;
@@ -23,51 +23,66 @@
   const compact = (value) => String(value ?? '').replace(/\s+/gu, ' ').trim();
   const textOf = (element) => compact(element.innerText ?? element.textContent);
   const comparable = (value) => compact(value).toLocaleLowerCase('ru').replaceAll('ё', 'е');
-  const offset = 3 * 3_600_000; // Europe/Moscow, all supported chat dates.
-  const dayMs = 86_400_000;
-  const recentWindow = 20 * 60_000;
+  const minuteMs = 60_000;
+  const recentWindow = 20 * minuteMs;
   const isRecent = (at, now = Date.now()) => Number.isFinite(at) && at <= now && now - at < recentWindow;
   const weekdays = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
 
-  function dateAt(year, month, day, hours, minutes, seconds = 0) {
-    const date = new Date(Date.UTC(year, month - 1, day, hours, minutes, seconds));
+  function dateAt(year, month, day, hours, minutes, seconds = 0, millis = 0, zonedLabel = '') {
+    const hour = hours ?? 0;
+    const date = new Date(Date.UTC(year, month - 1, day, hour, minutes, seconds, millis));
     if (year < 2000 || date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 ||
-        date.getUTCDate() !== day || date.getUTCHours() !== hours || date.getUTCMinutes() !== minutes ||
+        date.getUTCDate() !== day || date.getUTCHours() !== hour || date.getUTCMinutes() !== minutes ||
         date.getUTCSeconds() !== seconds) return null;
-    return date.getTime() - offset;
+    if (zonedLabel) return Date.parse(zonedLabel);
+    const local = new Date(year, month - 1, day, hour, minutes, seconds, millis);
+    if (local.getDate() !== day || (hours !== undefined &&
+        (local.getHours() !== hour || local.getMinutes() !== minutes))) return null;
+    return local.getTime();
   }
 
-  function parseActivity(value, now = Date.now()) {
+  function parseTimestamp(value, now) {
     const label = comparable(value);
-    const absolute = /^(\d{4})-(\d{2})-(\d{2})t(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,3})?)?(z|[+-]\d{2}:\d{2})?$/iu.exec(label);
+    const absolute = /^(\d{4})-(\d{2})-(\d{2})t(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(z|[+-]\d{2}:\d{2})?$/iu.exec(label);
     if (absolute) {
-      const [, y, m, d, h, min, s, zone] = absolute;
-      const local = dateAt(+y, +m, +d, +h, +min, +(s ?? 0));
-      const at = local === null ? null : zone ? Date.parse(label) : local;
-      return Number.isFinite(at) && at <= now ? { at, precision: s ? 'exact' : 'minute' } : null;
+      const [, y, m, d, h, min, s, fraction, zone] = absolute;
+      const millis = Number((fraction ?? '').padEnd(3, '0'));
+      const at = dateAt(+y, +m, +d, +h, +min, +(s ?? 0), millis, zone ? label : '');
+      return { at, precision: s ? 'exact' : 'minute', zone };
     }
-    const today = new Date(now + offset);
+    const today = new Date(now);
+    const year = today.getFullYear();
+    const month = today.getMonth() + 1;
+    const day = today.getDate();
     const timed = /^(?:(пн|вт|ср|чт|пт|сб|вс|сегодня|вчера)\.?\s*)?(\d{1,2}):(\d{2})(?::(\d{2}))?$/u.exec(label);
     if (timed) {
       const [, prefix, hour, minute, second] = timed;
       const dow = weekdays.indexOf(prefix);
-      const days = dow < 0 ? Number(prefix === 'вчера') : (today.getUTCDay() - dow + 7) % 7;
-      let at = dateAt(today.getUTCFullYear(), today.getUTCMonth() + 1, today.getUTCDate(), +hour, +minute, +(second ?? 0));
-      if (at === null) return null;
-      at -= days * dayMs;
-      if (at > now) {
-        if (prefix === 'сегодня') return null;
-        at -= (dow < 0 ? 1 : 7) * dayMs;
+      const days = dow < 0 ? Number(prefix === 'вчера') : (today.getDay() - dow + 7) % 7;
+      const fromDay = daysBack => {
+        const date = new Date(Date.UTC(year, month - 1, day - daysBack));
+        return dateAt(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate(), +hour, +minute, +(second ?? 0));
+      };
+      let at = fromDay(days);
+      if (at !== null && at > now && prefix !== 'сегодня') {
+        at = fromDay(days + (dow < 0 ? 1 : 7));
       }
       return { at, precision: second ? 'exact' : 'minute' };
     }
     const dated = /^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}|\d{2}))?\.?[,\s]*(?:(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/u.exec(label);
     if (!dated) return null;
-    const [, day, month, year, hour, minute, second] = dated;
-    let y = year ? (+year < 100 ? +year + 2000 : +year) : today.getUTCFullYear();
-    if (!year && (+month > today.getUTCMonth() + 1 || (+month === today.getUTCMonth() + 1 && +day > today.getUTCDate()))) y--;
-    const at = dateAt(y, +month, +day, +(hour ?? 0), +(minute ?? 0), +(second ?? 0));
-    return at !== null && at <= now ? { at, precision: second ? 'exact' : hour ? 'minute' : 'day' } : null;
+    const [, d, m, inputYear, hour, minute, second] = dated;
+    let y = inputYear ? (+inputYear < 100 ? +inputYear + 2000 : +inputYear) : year;
+    if (!inputYear && (+m > month || (+m === month && +d > day))) y--;
+    const at = dateAt(y, +m, +d, hour === undefined ? undefined : +hour, +(minute ?? 0), +(second ?? 0));
+    return { at, precision: second ? 'exact' : hour ? 'minute' : 'day' };
+  }
+
+  const usableTime = (stamp, now) => Number.isFinite(stamp?.at) && stamp.at <= now;
+
+  function parseActivity(value, now = Date.now()) {
+    const stamp = parseTimestamp(value, now);
+    return usableTime(stamp, now) ? { at: stamp.at, precision: stamp.precision } : null;
   }
 
   // Only use explicit DOM identifiers, never message previews, as a supplementary signal.
@@ -76,13 +91,56 @@
     return /^[\w.:-]{1,140}$/u.test(id ?? '') ? id : null;
   }
 
-  function rowStamp(row, label, now) {
-    for (const node of row.querySelectorAll('time, [datetime], [title]')) {
-      if (!isVisible(node) || textOf(node) !== label) continue;
-      const parsed = parseActivity(node.getAttribute('datetime') || node.getAttribute('title'), now);
-      if (parsed) return parsed;
+  const timeSelector = 'time, [datetime], [title]';
+  function stampWithSource(stamp, source, rejected, now) {
+    const at = usableTime(stamp, now) ? stamp.at : null;
+    const zone = stamp?.zone?.toLowerCase();
+    const offsetMinutes = zone === 'z' ? 0 : zone
+      ? (zone.startsWith('-') ? -1 : 1) * (Number(zone.slice(1, 3)) * 60 + Number(zone.slice(4)))
+      : Number.isFinite(stamp?.at) ? -new Date(stamp.at).getTimezoneOffset() : null;
+    return { at, precision: stamp?.precision, timeParse: {
+      source, at, precision: stamp?.precision, timezone: zone ? 'explicit' : 'assumed_local', offsetMinutes,
+      ...(at === null ? { reason: Number.isFinite(stamp?.at) ? 'future_timestamp' : 'invalid_timestamp' } : {}),
+      ...(rejected.length ? { rejected } : {})
+    } };
+  }
+
+  function selectTimestamp(nodes, label, now, history = false) {
+    const displayed = parseTimestamp(label, now);
+    const displayedMinute = displayed?.precision !== 'day' && Number.isFinite(displayed?.at)
+      ? Math.floor(displayed.at / minuteMs) * minuteMs : null;
+    const rejected = [];
+    for (const node of nodes) {
+      if (textOf(node) !== label || !isVisible(node)) continue;
+      for (const source of ['datetime', 'title']) {
+        const stamp = parseTimestamp(node.getAttribute(source), now);
+        if (!stamp) continue;
+        const explicit = source === 'datetime' && stamp.zone;
+        const sameMinute = usableTime(displayed, now) && stamp.at >= displayed.at && stamp.at < displayed.at + minuteMs;
+        if (usableTime(stamp, now)) {
+          if (history && explicit && stamp.precision === 'minute' && displayed?.precision === 'exact' &&
+              displayed.at >= stamp.at && displayed.at < stamp.at + minuteMs) {
+            return stampWithSource(displayed, 'text', rejected, now);
+          }
+          if (!history || explicit || (displayed?.precision === 'minute' && stamp.precision === 'exact' && sameMinute)) {
+            return stampWithSource(stamp, source, rejected, now);
+          }
+        }
+        if (stamp.precision === 'exact' && !rejected.some(item => item.source === source)) {
+          const reason = !Number.isFinite(stamp.at) ? 'invalid_timestamp' : stamp.at > now ? 'future_timestamp'
+            : !usableTime(displayed, now) || displayedMinute === null ? 'displayed_minute_unconfirmed'
+              : stamp.at < displayedMinute || stamp.at >= displayedMinute + minuteMs ? 'displayed_minute_mismatch'
+                : 'displayed_precision_preferred';
+          rejected.push({ source, reason,
+            deltaMs: displayedMinute !== null && Number.isFinite(stamp.at) ? stamp.at - displayedMinute : null });
+        }
+      }
     }
-    return parseActivity(label, now);
+    return stampWithSource(displayed, 'text', rejected, now);
+  }
+
+  function rowStamp(row, label, now) {
+    return selectTimestamp(row.querySelectorAll(timeSelector), label, now);
   }
 
   function isVisible(element) {
@@ -207,7 +265,14 @@
     return row?.closest('[role="list"]') ?? null;
   }
 
-  function getListLayout(root, rows) {
+  function layoutRowKey(element) {
+    const rowId = idAttribute(element, 'data-chat-id') || idAttribute(element, 'data-conversation-id');
+    if (rowId) return 'id:' + rowId;
+    const header = /^[★☆]\s*(.+?)\s*\$(\d+)\b/u.exec(assignmentField(element, textOf(element)).clean);
+    return header ? `${header[2]}:${comparable(header[1])}` : null;
+  }
+
+  function getListLayout(root, rows, identifyUnknown = false) {
     const byElement = new Map(rows.map(row => [row.rowElement, row.key]));
     const positions = [];
     const sizes = new Set();
@@ -217,12 +282,13 @@
       const size = domPosition(element, 'aria-setsize');
       const top = /translateY\((-?[\d.]+)px\)/u.exec(element.style?.transform || element.getAttribute('style') || '');
       if (size) sizes.add(size);
-      positions.push({ position, key: byElement.get(element) ?? textOf(element), top: top ? Number(top[1]) : null });
+      const key = byElement.get(element) ?? (identifyUnknown ? layoutRowKey(element) : null);
+      positions.push({ position, key, top: top ? Number(top[1]) : null });
     }
     return { total: sizes.size === 1 ? [...sizes][0] : null, positions };
   }
 
-  function getRows(listRoot = document, now = Date.now()) {
+  function getRows(listRoot = document, now = Date.now(), ambiguousFallbacks = null) {
     const rows = new Map();
     const ambiguous = new Set();
     const virtual = listRoot === document ? getVirtualList() : null;
@@ -242,6 +308,7 @@
       const key = rowId ? 'id:' + rowId : fallbackKey;
       if (rows.has(key)) {
         ambiguous.add(key);
+        if (!rowId && ambiguousFallbacks) ambiguousFallbacks.set(key, (ambiguousFallbacks.get(key) ?? 1) + 1);
         continue;
       }
 
@@ -447,6 +514,10 @@
     return !/^(?:(?:спасибо(?:\s+(?:вам|большое|огромное)){0,2}|(?:большое|огромное) спасибо|благодарю(?: вас)?|(?:(?:все|теперь|тогда)\s+)?(?:понял[аи]?|понятно|ясно)|хорошо|ладно|ок(?:ей)?|да|ага|супер|отлично)(?:\s+|$)){1,4}$/u.test(words);
   }
 
+  function messageStamp(root, label, now = Date.now()) {
+    return selectTimestamp(root ? [root, ...root.querySelectorAll(timeSelector)] : [], label, now, true);
+  }
+
   function readSiteHistory(conversation) {
     const history = conversation.root.querySelector?.('#scroll');
     if (!history) return null;
@@ -459,13 +530,15 @@
       const id = idAttribute(holder, 'id')?.slice('message-'.length);
       const author = textOf(holder.querySelector('[class*="messegeInfo_name"]') || {});
       const handle = /^@user_(\d+)$/u.exec(textOf(holder.querySelector('[class*="messegeInfo_info"]') || {}))?.[1];
-      const timestamp = textOf(holder.querySelector('[class*="messegeInfo_time"]') || {});
-      const time = parseActivity(timestamp)?.at;
-      if (!id || seen.has(id) || !Number.isFinite(time)) return { entries: [], settled: false };
+      const timeNode = holder.querySelector('[class*="messegeInfo_time"]');
+      const timestamp = textOf(timeNode || {});
+      const stamp = messageStamp(timeNode, timestamp);
+      if (!id || seen.has(id)) return { entries: [], settled: false };
+      if (!Number.isFinite(stamp.at)) return { entries: [], settled: false, invalidTime: stamp.timeParse };
       seen.add(id);
       // The author and timestamp are present even when the reply is only an emoji.
       const kind = author && handle ? classify(author, handle, conversation.studentHandle) : 'unknown';
-      const message = { id, author, time, timestamp, kind };
+      const message = { id, author, time: stamp.at, precision: stamp.precision, timeParse: stamp.timeParse, timestamp, kind };
       if (kind === 'student') {
         const attachment = holder.querySelector('[class*="NewChat_chat__messegeImg"], [class*="attachment"], a[download]');
         const body = holder.querySelector('[class*="messegeText"]');
@@ -503,23 +576,22 @@
     for (let level = 0; element && element !== conversation.root && level < 5; level += 1, element = element.parentElement) {
       const match = messagePattern.exec(textOf(element));
       if (!match || !isVisible(element)) continue;
-      const { author: rawAuthor, handle, timestamp, date, hour, minute } = match.groups;
+      const { author: rawAuthor, handle, timestamp } = match.groups;
       const author = rawAuthor.trim();
       if (!isMessageMetadata(element, author, handle, timestamp)) continue;
 
-      const displayTime = `${date} ${hour.padStart(2, '0')}:${minute}`;
-      const [d, m, y] = date.split('.').map(Number);
-      const time = dateAt(y, m, d, +hour, +minute);
-      if (!Number.isFinite(time)) return null;
+      const stamp = messageStamp(element, timestamp);
+      if (!Number.isFinite(stamp.at)) return null;
       const holder = element.closest?.('[data-message-id]');
       const id = holder && conversation.root.contains(holder) ? idAttribute(holder, 'data-message-id') : null;
-      return { element, message: { ...(id ? { id } : {}), author, time, timestamp: displayTime,
+      return { element, message: { ...(id ? { id } : {}), author, time: stamp.at, precision: stamp.precision,
+        timeParse: stamp.timeParse, timestamp,
         kind: classify(author, handle, conversation.studentHandle) } };
     }
     return null;
   }
 
-  function getChat() {
+  function getChat(recordInvalidTime) {
     const composer = document.getElementById('chat-text-input');
     if (!composer || !isVisible(composer)) return null;
     const conversation = findIdentity(composer);
@@ -529,7 +601,10 @@
     if (Array.from(root.querySelectorAll('[aria-busy="true"], [role="progressbar"], .ant-spin-spinning'))
         .some(isVisible)) return null;
     const site = readSiteHistory(conversation);
-    if (site && !site.settled) return null;
+    if (site && !site.settled) {
+      if (site.invalidTime) recordInvalidTime?.(site.invalidTime, id);
+      return null;
+    }
     const seenHeaders = new Set();
     const entries = site?.entries ?? [];
     const markers = [];
@@ -552,9 +627,13 @@
     };
     for (const { node, label } of markers) {
       if (belongsToHeader(node)) continue;
-      const stamp = parseActivity(label);
-      if (!stamp) return null;
-      entries.push({ element: node.parentElement, message: { author: '', time: stamp.at, kind: 'unknown' } });
+      const stamp = messageStamp(node.parentElement, label);
+      if (!Number.isFinite(stamp.at)) {
+        recordInvalidTime?.(stamp.timeParse, id);
+        return null;
+      }
+      entries.push({ element: node.parentElement,
+        message: { author: '', time: stamp.at, precision: stamp.precision, timeParse: stamp.timeParse, kind: 'unknown' } });
     }
     // When the interface exposes message containers, a visible container without
     // any timestamp has an unknown position in the two-hour window.
@@ -564,7 +643,13 @@
     entries.sort((a, b) => a.element === b.element ? 0 :
       a.element.compareDocumentPosition(b.element) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1);
     const messages = entries.map(e => e.message);
-    if (messages.some((m, i) => i > 0 && m.time < messages[i - 1].time)) return null;
+    let earliest = -Infinity;
+    for (const { time, precision } of messages) {
+      earliest = Math.max(earliest, time);
+      const latest = precision === 'day' ? new Date(time).setHours(24, 0, 0, 0) - 1
+        : time + (precision === 'minute' ? minuteMs - 1 : 0);
+      if (latest < earliest) return null;
+    }
     const paging = Array.from(root.querySelectorAll('button, [role="button"]')).filter(element =>
       /^(?:загрузить\s+ещ[её]|(?:показать|загрузить)\s+(?:предыдущие|ранние)\s+сообщения)$/iu.test(textOf(element)));
     const loadMore = paging.find(element => isVisible(element) && !element.disabled);

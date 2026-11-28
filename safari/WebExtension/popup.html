@@ -24,7 +24,7 @@
     <div id="monitor-controls" hidden>
       <p id="connection" class="connection">Статус неизвестен</p>
       <dl>
-        <div><dt>Состав на час</dt><dd id="period">—</dd></div>
+        <div><dt>Состав на час</dt><dd><span id="period">—</span><small id="period-local" hidden></small></dd></div>
         <div><dt>Таблица прочитана</dt><dd id="last-read">—</dd></div>
         <div><dt>В очереди</dt><dd id="pending">0</dd></div>
         <div><dt>Не определено</dt><dd id="uncertain">0</dd></div>
@@ -53,6 +53,11 @@
       <p id="notification-help" class="hint notification-help">При первой проверке macOS может запросить разрешение на уведомления.</p>
       <div class="shift">
         <button id="finish" type="button" disabled>Завершить смену и сбросить привязки</button>
+        <details>
+          <summary>Журналы смены</summary>
+          <p id="log-status" class="note" role="status">Папка выгрузки — Загрузки/logs.</p>
+          <button id="export-logs" type="button" disabled>Повторить выгрузку журнала</button>
+        </details>
       </div>
     </div>
   </main>

@@ -11,11 +11,13 @@
     try {
       reply = await api.runtime.sendNativeMessage(application, { version: 1, action, ...fields });
     } catch {
-      throw new Error('Safari не связался с приложением «Школково для Safari». Открой установленное приложение.');
+      throw Object.assign(new Error('Safari не связался с приложением «Школково для Safari». Открой установленное приложение.'),
+        { code: 'nativeUnavailable' });
     }
     if (reply?.ok) return reply;
     if (reply?.code === 'notAuthorized' || reply?.code === 'notificationsDisabled') throw permissionFailure(reply.code);
-    throw new Error('Не удалось выполнить действие с уведомлением macOS.');
+    const code = ['invalidRequest', 'nativeError', 'logWriteFailed'].includes(reply?.code) ? reply.code : 'nativeError';
+    throw Object.assign(new Error('Не удалось выполнить действие в приложении macOS.'), { code });
   }
 
   globalThis.ShkolkovoNotifications = {
@@ -32,6 +34,10 @@
     },
     async clear(id) {
       return (await request('clear', { id })).cleared;
+    },
+    async writeLog(filename, text) {
+      const reply = await request('exportLog', { filename, text });
+      return reply.filename === filename;
     },
   };
 })();

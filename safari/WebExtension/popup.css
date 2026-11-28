@@ -84,6 +84,7 @@ p {
 .shift #finish { margin-top: 0; }
 
 details { margin-top: 8px; }
+#period-local { display: block; font-size: 0.75rem; opacity: 0.75; }
 summary { cursor: pointer; font-weight: 600; }
 #free-empty, #free-list { margin: 6px 0 0 17px; }
 #free-list { list-style: none; padding: 0; max-height: 180px; overflow: auto; }

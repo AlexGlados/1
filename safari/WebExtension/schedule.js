@@ -4,6 +4,17 @@
   'use strict';
   const weekdays = ['воскресенье', 'понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота'];
   const day = 86400000;
+  const codes = new WeakMap();
+
+  function scheduleError(code, message) {
+    const error = new Error(message);
+    codes.set(error, code);
+    return error;
+  }
+
+  function errorCode(error) {
+    return codes.get(error) ?? 'schedule_unknown';
+  }
 
   function utcDay(year, month, date) {
     const value = new Date(Date.UTC(year, month - 1, date));
@@ -19,7 +30,9 @@
   function selectWeek(html, requestedDay, entryGid) {
     // Parse the public tab menu as data. Never evaluate script from the sheet.
     const items = [...html.matchAll(/items\.push\(\{\s*name:\s*"([^"]*)"\s*,\s*pageUrl:\s*"[^"]*"\s*,\s*gid:\s*"(\d+)"/g)];
-    if (!items.some(item => item[2] === entryGid)) throw new Error('Не удалось прочитать вкладки Google Таблицы');
+    if (!items.some(item => item[2] === entryGid)) {
+      throw scheduleError('schedule_tabs', 'Не удалось прочитать вкладки Google Таблицы');
+    }
     const matches = [];
     for (const [, title, gid] of items) {
       const range = /^(\d{2}\.\d{2}\.(?:\d{4}|\d{2}))\s*[-–—]\s*(\d{2}\.\d{2}\.(?:\d{4}|\d{2}))$/.exec(title);
@@ -29,8 +42,8 @@
       if (end - start !== 6 * day || new Date(start).getUTCDay() !== 1) continue;
       if (start <= requestedDay && requestedDay <= end) matches.push({title, gid});
     }
-    if (!matches.length) throw new Error('Нет датированного листа на нужную неделю');
-    if (matches.length !== 1) throw new Error('Найдены несколько листов на одну неделю');
+    if (!matches.length) throw scheduleError('schedule_week_missing', 'Нет датированного листа на нужную неделю');
+    if (matches.length !== 1) throw scheduleError('schedule_week_ambiguous', 'Найдены несколько листов на одну неделю');
     return matches[0];
   }
 
@@ -57,10 +70,10 @@
       } else if (char === '"' && !cell && !closed) {
         quoted = true;
       } else if (char === '"' || closed) {
-        throw new Error('Нарушен формат CSV расписания');
+        throw scheduleError('schedule_csv', 'Нарушен формат CSV расписания');
       } else cell += char;
     }
-    if (quoted) throw new Error('Неполные данные CSV расписания');
+    if (quoted) throw scheduleError('schedule_csv', 'Неполные данные CSV расписания');
     if (row.length || cell || closed) { row.push(cell.trim()); rows.push(row); }
     return rows;
   }
@@ -73,37 +86,42 @@
   function hourAssignments(csv, requestedDay, hour) {
     const [header, ...rows] = csvRows(csv);
     if (header?.[0]?.toLowerCase() !== 'день' || header[2]?.toLowerCase() !== 'старший' || header[4]?.toLowerCase() !== 'веб') {
-      throw new Error('Не распознаны столбцы недельного листа');
+      throw scheduleError('schedule_roster', 'Не распознаны столбцы недельного листа');
     }
     const weekday = weekdays[new Date(requestedDay).getUTCDay()];
     const selected = rows.filter(row => {
       const time = /^(\d{1,2}):00(?::00)?$/.exec(row[1]);
       return row[0].toLowerCase() === weekday && time && Number(time[1]) === hour;
     });
-    if (!selected.length) throw new Error('В недельном листе нет строки на нужный час');
-    if (selected.length !== 1) throw new Error('В недельном листе несколько строк на один час');
+    if (!selected.length) throw scheduleError('schedule_hour_missing', 'В недельном листе нет строки на нужный час');
+    if (selected.length !== 1) throw scheduleError('schedule_hour_ambiguous', 'В недельном листе несколько строк на один час');
     const row = selected[0];
-    if (row.length !== header.length) throw new Error('Неполная строка расписания');
+    if (row.length !== header.length) throw scheduleError('schedule_roster', 'Неполная строка расписания');
     const assignments = new Map();
     const directory = new Map();
     let filled = 0;
     for (let i = 5; i < row.length; i++) {
       if (header[i]) {
-        if (!fullName.test(header[i])) throw new Error('Не распознано имя в заголовке персонального столбца');
+        if (!fullName.test(header[i])) {
+          throw scheduleError('schedule_roster', 'Не распознано имя в заголовке персонального столбца');
+        }
         directory.set(nameKey(header[i]), header[i]);
       }
       if (!row[i]) continue;
       const key = nameKey(row[i]);
       if (!fullName.test(row[i]) || key !== nameKey(header[i])) {
-        throw new Error('В персональном столбце не распознано назначение');
+        throw scheduleError('schedule_roster', 'В персональном столбце не распознано назначение');
       }
       assignments.set(key, header[i]);
       filled++;
     }
-    if (!filled) throw new Error('На нужный час нет заполненных назначений');
-    if (!/^\d+$/.test(row[3]) || Number(row[3]) !== filled) throw new Error('Число назначений расходится с итогом в строке');
+    if (!/^\d+$/.test(row[3]) || Number(row[3]) !== filled) {
+      throw scheduleError('schedule_roster', 'Число назначений расходится с итогом в строке');
+    }
     for (const name of [row[2], row[4]]) {
-      if (name && !assignments.has(nameKey(name))) throw new Error('Назначение в столбце роли расходится с персональными столбцами');
+      if (name && !assignments.has(nameKey(name))) {
+        throw scheduleError('schedule_roster', 'Назначение в столбце роли расходится с персональными столбцами');
+      }
     }
     return {names: [...assignments.values()], directory: [...directory.values()]};
   }
@@ -118,7 +136,7 @@
             typeof entryGid === 'string' && /^\d+$/.test(entryGid)) return {spreadsheetId, entryGid};
       }
     } catch { /* A missing resource or invalid JSON requires local setup. */ }
-    throw new Error('Укажи spreadsheetId и entryGid в файле schedule-config.json');
+    throw scheduleError('schedule_config', 'Укажи spreadsheetId и entryGid в файле schedule-config.json');
   }
 
   async function getText(url) {
@@ -127,16 +145,20 @@
       response = await fetch(url, {credentials: 'omit', cache: 'no-store', referrerPolicy: 'no-referrer', redirect: 'error', signal: AbortSignal.timeout(12000)});
       if (response.ok) return await response.text();
     } catch (error) {
-      if (error.name === 'TimeoutError' || error.name === 'AbortError') throw new Error('Google Таблица не ответила вовремя');
-      throw new Error('Не удалось прочитать Google Таблицу по сети');
+      if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+        throw scheduleError('schedule_timeout', 'Google Таблица не ответила вовремя');
+      }
+      throw scheduleError('schedule_network', 'Не удалось прочитать Google Таблицу по сети');
     }
-    throw new Error('Google Таблица вернула HTTP ' + response.status);
+    throw scheduleError('schedule_http', 'Google Таблица вернула HTTP ' + response.status);
   }
 
   async function read(date, hour) {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isInteger(hour) || hour < 0 || hour > 23) throw new Error('Неверная дата или час расписания');
+    if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isInteger(hour) || hour < 0 || hour > 23) {
+      throw scheduleError('schedule_request', 'Неверная дата или час расписания');
+    }
     const requestedDay = utcDay(...date.split('-').map(Number));
-    if (!Number.isFinite(requestedDay)) throw new Error('Неверная дата расписания');
+    if (!Number.isFinite(requestedDay)) throw scheduleError('schedule_request', 'Неверная дата расписания');
     const {spreadsheetId, entryGid} = await readConfig();
     const base = 'https://docs.google.com/spreadsheets/d/' + spreadsheetId;
     const index = await getText(base + '/htmlview?gid=' + entryGid);
@@ -145,5 +167,5 @@
     return {...hourAssignments(csv, requestedDay, hour), sheet: sheet.title};
   }
 
-  globalThis.ShSchedule = Object.freeze({read});
+  globalThis.ShSchedule = Object.freeze({read, errorCode});
 })();

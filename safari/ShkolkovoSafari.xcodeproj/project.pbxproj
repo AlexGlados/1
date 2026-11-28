@@ -49,6 +49,12 @@
 			path = Sandbox.entitlements;
 			sourceTree = "<group>";
 		};
+		000000000000000000000047 = {
+			isa = PBXFileReference;
+			lastKnownFileType = text.plist.entitlements;
+			path = Extension.entitlements;
+			sourceTree = "<group>";
+		};
 		000000000000000000000008 = {
 			isa = PBXGroup;
 			children = (
@@ -57,6 +63,7 @@
 				000000000000000000000005,
 				000000000000000000000006,
 				000000000000000000000007,
+				000000000000000000000047,
 			);
 			path = Native;
 			sourceTree = "<group>";
@@ -175,6 +182,12 @@
 			path = time.js;
 			sourceTree = "<group>";
 		};
+		000000000000000000000048 = {
+			isa = PBXFileReference;
+			lastKnownFileType = sourcecode.javascript;
+			path = "shift-log.js";
+			sourceTree = "<group>";
+		};
 		000000000000000000000018 = {
 			isa = PBXGroup;
 			children = (
@@ -197,6 +210,7 @@
 				000000000000000000000040,
 				000000000000000000000043,
 				000000000000000000000045,
+				000000000000000000000048,
 			);
 			path = WebExtension;
 			sourceTree = "<group>";
@@ -319,6 +333,10 @@
 			isa = PBXBuildFile;
 			fileRef = 000000000000000000000045;
 		};
+		000000000000000000000049 = {
+			isa = PBXBuildFile;
+			fileRef = 000000000000000000000048;
+		};
 		00000000000000000000002E = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -342,6 +360,7 @@
 				000000000000000000000042,
 				000000000000000000000044,
 				000000000000000000000046,
+				000000000000000000000049,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -370,10 +389,10 @@
 			buildSettings = {
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 7;
+				CURRENT_PROJECT_VERSION = 8;
 				DEVELOPMENT_LANGUAGE = ru;
 				MACOSX_DEPLOYMENT_TARGET = 14.4;
-				MARKETING_VERSION = 1.10.0;
+				MARKETING_VERSION = 1.11.7;
 				SDKROOT = macosx;
 				SUPPORTED_PLATFORMS = macosx;
 				SWIFT_VERSION = 5.0;
@@ -387,10 +406,10 @@
 			buildSettings = {
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 7;
+				CURRENT_PROJECT_VERSION = 8;
 				DEVELOPMENT_LANGUAGE = ru;
 				MACOSX_DEPLOYMENT_TARGET = 14.4;
-				MARKETING_VERSION = 1.10.0;
+				MARKETING_VERSION = 1.11.7;
 				SDKROOT = macosx;
 				SUPPORTED_PLATFORMS = macosx;
 				SWIFT_VERSION = 5.0;
@@ -452,7 +471,7 @@
 		000000000000000000000037 = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = Native/Sandbox.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Native/Extension.entitlements;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -471,7 +490,7 @@
 		000000000000000000000038 = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = Native/Sandbox.entitlements;
+				CODE_SIGN_ENTITLEMENTS = Native/Extension.entitlements;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				PRODUCT_NAME = "$(TARGET_NAME)";
