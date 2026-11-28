@@ -41,14 +41,14 @@
     return local.getTime();
   }
 
-  function parseActivity(value, now = Date.now()) {
+  function parseTimestamp(value, now) {
     const label = comparable(value);
     const absolute = /^(\d{4})-(\d{2})-(\d{2})t(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(z|[+-]\d{2}:\d{2})?$/iu.exec(label);
     if (absolute) {
       const [, y, m, d, h, min, s, fraction, zone] = absolute;
       const millis = Number((fraction ?? '').padEnd(3, '0'));
       const at = dateAt(+y, +m, +d, +h, +min, +(s ?? 0), millis, zone ? label : '');
-      return Number.isFinite(at) && at <= now ? { at, precision: s ? 'exact' : 'minute' } : null;
+      return { at, precision: s ? 'exact' : 'minute', zone };
     }
     const today = new Date(now);
     const year = today.getFullYear();
@@ -64,11 +64,10 @@
         return dateAt(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate(), +hour, +minute, +(second ?? 0));
       };
       let at = fromDay(days);
-      if (at !== null && at > now) {
-        if (prefix === 'сегодня') return null;
+      if (at !== null && at > now && prefix !== 'сегодня') {
         at = fromDay(days + (dow < 0 ? 1 : 7));
       }
-      return at !== null && at <= now ? { at, precision: second ? 'exact' : 'minute' } : null;
+      return { at, precision: second ? 'exact' : 'minute' };
     }
     const dated = /^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}|\d{2}))?\.?[,\s]*(?:(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/u.exec(label);
     if (!dated) return null;
@@ -76,7 +75,14 @@
     let y = inputYear ? (+inputYear < 100 ? +inputYear + 2000 : +inputYear) : year;
     if (!inputYear && (+m > month || (+m === month && +d > day))) y--;
     const at = dateAt(y, +m, +d, hour === undefined ? undefined : +hour, +(minute ?? 0), +(second ?? 0));
-    return at !== null && at <= now ? { at, precision: second ? 'exact' : hour ? 'minute' : 'day' } : null;
+    return { at, precision: second ? 'exact' : hour ? 'minute' : 'day' };
+  }
+
+  const usableTime = (stamp, now) => Number.isFinite(stamp?.at) && stamp.at <= now;
+
+  function parseActivity(value, now = Date.now()) {
+    const stamp = parseTimestamp(value, now);
+    return usableTime(stamp, now) ? { at: stamp.at, precision: stamp.precision } : null;
   }
 
   // Only use explicit DOM identifiers, never message previews, as a supplementary signal.
@@ -85,13 +91,56 @@
     return /^[\w.:-]{1,140}$/u.test(id ?? '') ? id : null;
   }
 
-  function rowStamp(row, label, now) {
-    for (const node of row.querySelectorAll('time, [datetime], [title]')) {
-      if (!isVisible(node) || textOf(node) !== label) continue;
-      const parsed = parseActivity(node.getAttribute('datetime'), now) ?? parseActivity(node.getAttribute('title'), now);
-      if (parsed) return parsed;
+  const timeSelector = 'time, [datetime], [title]';
+  function stampWithSource(stamp, source, rejected, now) {
+    const at = usableTime(stamp, now) ? stamp.at : null;
+    const zone = stamp?.zone?.toLowerCase();
+    const offsetMinutes = zone === 'z' ? 0 : zone
+      ? (zone.startsWith('-') ? -1 : 1) * (Number(zone.slice(1, 3)) * 60 + Number(zone.slice(4)))
+      : Number.isFinite(stamp?.at) ? -new Date(stamp.at).getTimezoneOffset() : null;
+    return { at, precision: stamp?.precision, timeParse: {
+      source, at, precision: stamp?.precision, timezone: zone ? 'explicit' : 'assumed_local', offsetMinutes,
+      ...(at === null ? { reason: Number.isFinite(stamp?.at) ? 'future_timestamp' : 'invalid_timestamp' } : {}),
+      ...(rejected.length ? { rejected } : {})
+    } };
+  }
+
+  function selectTimestamp(nodes, label, now, history = false) {
+    const displayed = parseTimestamp(label, now);
+    const displayedMinute = displayed?.precision !== 'day' && Number.isFinite(displayed?.at)
+      ? Math.floor(displayed.at / minuteMs) * minuteMs : null;
+    const rejected = [];
+    for (const node of nodes) {
+      if (textOf(node) !== label || !isVisible(node)) continue;
+      for (const source of ['datetime', 'title']) {
+        const stamp = parseTimestamp(node.getAttribute(source), now);
+        if (!stamp) continue;
+        const explicit = source === 'datetime' && stamp.zone;
+        const sameMinute = usableTime(displayed, now) && stamp.at >= displayed.at && stamp.at < displayed.at + minuteMs;
+        if (usableTime(stamp, now)) {
+          if (history && explicit && stamp.precision === 'minute' && displayed?.precision === 'exact' &&
+              displayed.at >= stamp.at && displayed.at < stamp.at + minuteMs) {
+            return stampWithSource(displayed, 'text', rejected, now);
+          }
+          if (!history || explicit || (displayed?.precision === 'minute' && stamp.precision === 'exact' && sameMinute)) {
+            return stampWithSource(stamp, source, rejected, now);
+          }
+        }
+        if (stamp.precision === 'exact' && !rejected.some(item => item.source === source)) {
+          const reason = !Number.isFinite(stamp.at) ? 'invalid_timestamp' : stamp.at > now ? 'future_timestamp'
+            : !usableTime(displayed, now) || displayedMinute === null ? 'displayed_minute_unconfirmed'
+              : stamp.at < displayedMinute || stamp.at >= displayedMinute + minuteMs ? 'displayed_minute_mismatch'
+                : 'displayed_precision_preferred';
+          rejected.push({ source, reason,
+            deltaMs: displayedMinute !== null && Number.isFinite(stamp.at) ? stamp.at - displayedMinute : null });
+        }
+      }
     }
-    return parseActivity(label, now);
+    return stampWithSource(displayed, 'text', rejected, now);
+  }
+
+  function rowStamp(row, label, now) {
+    return selectTimestamp(row.querySelectorAll(timeSelector), label, now);
   }
 
   function isVisible(element) {
@@ -466,24 +515,7 @@
   }
 
   function messageStamp(root, label, now = Date.now()) {
-    const displayed = parseActivity(label, now);
-    if (!root) return displayed;
-    for (const node of [root, ...root.querySelectorAll('time, [datetime], [title]')]) {
-      if (textOf(node) !== label || !isVisible(node)) continue;
-      const datetime = node.getAttribute('datetime');
-      const machine = parseActivity(datetime, now);
-      if (machine && /(?:z|[+-]\d{2}:\d{2})\s*$/iu.test(datetime)) {
-        // A zoned datetime identifies the instant even during a repeated local hour.
-        if (machine.precision === 'minute' && displayed?.precision === 'exact' &&
-            displayed.at >= machine.at && displayed.at < machine.at + minuteMs) return displayed;
-        return machine;
-      }
-      if (displayed?.precision !== 'minute') continue;
-      for (const stamp of [machine, parseActivity(node.getAttribute('title'), now)]) {
-        if (stamp?.precision === 'exact' && stamp.at >= displayed.at && stamp.at < displayed.at + minuteMs) return stamp;
-      }
-    }
-    return displayed;
+    return selectTimestamp(root ? [root, ...root.querySelectorAll(timeSelector)] : [], label, now, true);
   }
 
   function readSiteHistory(conversation) {
@@ -501,11 +533,12 @@
       const timeNode = holder.querySelector('[class*="messegeInfo_time"]');
       const timestamp = textOf(timeNode || {});
       const stamp = messageStamp(timeNode, timestamp);
-      if (!id || seen.has(id) || !stamp) return { entries: [], settled: false };
+      if (!id || seen.has(id)) return { entries: [], settled: false };
+      if (!Number.isFinite(stamp.at)) return { entries: [], settled: false, invalidTime: stamp.timeParse };
       seen.add(id);
       // The author and timestamp are present even when the reply is only an emoji.
       const kind = author && handle ? classify(author, handle, conversation.studentHandle) : 'unknown';
-      const message = { id, author, time: stamp.at, precision: stamp.precision, timestamp, kind };
+      const message = { id, author, time: stamp.at, precision: stamp.precision, timeParse: stamp.timeParse, timestamp, kind };
       if (kind === 'student') {
         const attachment = holder.querySelector('[class*="NewChat_chat__messegeImg"], [class*="attachment"], a[download]');
         const body = holder.querySelector('[class*="messegeText"]');
@@ -548,16 +581,17 @@
       if (!isMessageMetadata(element, author, handle, timestamp)) continue;
 
       const stamp = messageStamp(element, timestamp);
-      if (!stamp) return null;
+      if (!Number.isFinite(stamp.at)) return null;
       const holder = element.closest?.('[data-message-id]');
       const id = holder && conversation.root.contains(holder) ? idAttribute(holder, 'data-message-id') : null;
-      return { element, message: { ...(id ? { id } : {}), author, time: stamp.at, precision: stamp.precision, timestamp,
+      return { element, message: { ...(id ? { id } : {}), author, time: stamp.at, precision: stamp.precision,
+        timeParse: stamp.timeParse, timestamp,
         kind: classify(author, handle, conversation.studentHandle) } };
     }
     return null;
   }
 
-  function getChat() {
+  function getChat(recordInvalidTime) {
     const composer = document.getElementById('chat-text-input');
     if (!composer || !isVisible(composer)) return null;
     const conversation = findIdentity(composer);
@@ -567,7 +601,10 @@
     if (Array.from(root.querySelectorAll('[aria-busy="true"], [role="progressbar"], .ant-spin-spinning'))
         .some(isVisible)) return null;
     const site = readSiteHistory(conversation);
-    if (site && !site.settled) return null;
+    if (site && !site.settled) {
+      if (site.invalidTime) recordInvalidTime?.(site.invalidTime, id);
+      return null;
+    }
     const seenHeaders = new Set();
     const entries = site?.entries ?? [];
     const markers = [];
@@ -591,9 +628,12 @@
     for (const { node, label } of markers) {
       if (belongsToHeader(node)) continue;
       const stamp = messageStamp(node.parentElement, label);
-      if (!stamp) return null;
+      if (!Number.isFinite(stamp.at)) {
+        recordInvalidTime?.(stamp.timeParse, id);
+        return null;
+      }
       entries.push({ element: node.parentElement,
-        message: { author: '', time: stamp.at, precision: stamp.precision, kind: 'unknown' } });
+        message: { author: '', time: stamp.at, precision: stamp.precision, timeParse: stamp.timeParse, kind: 'unknown' } });
     }
     // When the interface exposes message containers, a visible container without
     // any timestamp has an unknown position in the two-hour window.

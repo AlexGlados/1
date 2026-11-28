@@ -130,8 +130,9 @@
     const fallbackConflicts = new Set(ambiguousFallbacks.keys());
     const snapshot = { ready, observedAt, partial: true, layout, ordered, ambiguousFallbacks, fallbackConflicts,
       unrecognized: rows.filter(row => !Number.isFinite(row.at)).map(row => row.key),
-      rows: ready ? parsed.map(({ key, label, fallbackKey, at, precision, pinned, signal, assignedToSelf, unread, position }) => ({
+      rows: ready ? parsed.map(({ key, label, fallbackKey, at, precision, timeParse, pinned, signal, assignedToSelf, unread, position }) => ({
       id: key, title: label, at, precision, pinned, ...(signal ? { signal } : {}),
+      ...(timeParse ? { timeParse } : {}),
       ...(fallbackKey ? { fallbackKey } : {}), ...(selectedId && selected.key === key ? { identity: selectedId } : {}),
       ...(Number.isSafeInteger(position) ? { position } : {}), ...(typeof unread === 'boolean' ? { unread } : {}),
       ...(typeof assignedToSelf === 'boolean' ? { assignedToSelf } : {}),
@@ -674,6 +675,7 @@
     const unrecognized = new Set();
     let stable = true;
     let positioned = true;
+    let timeBoundary;
     const inScope = row => row.precision !== 'day' && latestPossibleAt(row) > cutoff;
     const capture = async frame => {
       rememberRows(found, conflicts, frame);
@@ -681,6 +683,7 @@
       stable &&= rememberRowOrder(frame, keys, rowPositions, duplicates);
       if (frame.layout) positioned &&= rowsHavePositions(frame) && frame.layout.total === snapshot.layout.total;
       for (const key of frame.unrecognized) unrecognized.add(key);
+      timeBoundary ??= frame.rows.find(row => latestPossibleAt(row) <= cutoff);
       const rows = frame.rows.filter(row => inScope(row) && !ambiguous.has(row.id) &&
         !conflicts.has(row.id) && !duplicates.has(row.id));
       if (rows.length) await publishRows(frame, rows);
@@ -736,6 +739,9 @@
       : { skipped: null, ranges: [] };
     return { complete, rows, skipped: skipped === null ? null : skipped + ambiguousCount,
       ranges, ambiguousKeys: [...conflicts], observedAt: Date.now(), startedAt,
+      ...(complete && timeBoundary?.timeParse && !conflicts.has(timeBoundary.id) ? {
+        timeBoundary: { id: timeBoundary.id, identity: timeBoundary.identity, at: timeBoundary.at, timeParse: timeBoundary.timeParse }
+      } : {}),
       reason: complete ? '' : 'Не удалось завершить начальный просмотр чатов.' };
   }
 
@@ -755,11 +761,11 @@
     try {
       const result = await surveyInitial(cutoff, controller, current, (frame, rows) => publish({ ...frame, rows }));
       if (!result || !current()) return;
-      const { complete, rows, skipped, ranges, observedAt, startedAt, reason } = result;
+      const { complete, rows, skipped, ranges, observedAt, startedAt, reason, timeBoundary } = result;
       positions.clear();
       for (const row of rows) if (Number.isSafeInteger(row.position)) positions.set(row.id, row.position);
       const reply = await reportCoverage(complete, rows.length, reason,
-        { observedAt, rows, skipped, ...(complete ? { headThrough: startedAt, recoveryRanges: ranges } : {}) });
+        { observedAt, rows, skipped, ...(complete ? { headThrough: startedAt, recoveryRanges: ranges, timeBoundary } : {}) });
       if (complete && reply?.ok && session === startedSession) {
         startupCutoff = null;
         headThrough = Math.max(headThrough ?? -Infinity, startedAt);
@@ -924,7 +930,7 @@
 
   const normalizeName = name => String(name ?? '').normalize('NFKC').toLocaleLowerCase('ru').replaceAll('ё', 'е')
     .trim().split(/\s+/u).sort().join(' ');
-  function panelMatches(chat, row, identity, selectedAfterClick = false) {
+  function panelMatches(chat, row, identity, selectedAfterClick = false, recordTime) {
     if (!chat || chat.course !== row.course || !chat.messages.length) return false;
     if (identity && chat.id !== identity) return false;
     if (/^\d+__\d+__\d+$/u.test(row.rowId ?? '')) {
@@ -933,6 +939,7 @@
       return false;
     }
     const last = chat.messages.at(-1);
+    recordTime?.(last.timeParse);
     if (row.signal && last.id && row.signal !== last.id) return false;
     if (row.precision === 'day') {
       return last.time >= row.at && last.time <= latestPossibleAt(row);
@@ -942,7 +949,7 @@
 
   // Once the selected panel has the right identity, tail and timestamp, allow its rendering
   // to settle. New jobs can abort this wait immediately when the shift ends or the user clicks.
-  function waitPanel(row, identity, controller, previous = null, switchedFrom = null, allowed = canInspect) {
+  function waitPanel(row, identity, controller, previous = null, switchedFrom = null, allowed = canInspect, recordTime) {
     return new Promise(resolve => {
       let settle;
       let deadline;
@@ -963,10 +970,10 @@
         if (controller.signal.aborted || !allowed()) return null;
         const current = lookup(row.key);
         if (ambiguous.has(row.key) || current?.selected === false) return null;
-        const chat = dom.getChat();
+        const chat = dom.getChat(recordTime);
         if (!chat || (switchedFrom && chat.id === switchedFrom.id &&
             chat.messages.at(-1)?.id === switchedFrom.messages.at(-1)?.id)) return null;
-        if (!panelMatches(chat, row, identity, current?.selected === true && Boolean(switchedFrom?.id !== chat.id))) return null;
+        if (!panelMatches(chat, row, identity, current?.selected === true && Boolean(switchedFrom?.id !== chat.id), recordTime)) return null;
         if (previous && !chat.historyComplete && previous.messages.length >= chat.messages.length &&
             previous.messages[0].time <= chat.messages[0].time) return null;
         return chat;
@@ -1046,9 +1053,15 @@
   async function read(request) {
     const { id, job = {} } = request;
     const rowKey = job.rowKey || id;
+    const timeDiagnostics = {};
+    let expectedIdentity;
+    const recordTime = (stamp, identity) => {
+      if (stamp && (identity === undefined || identity === expectedIdentity)) timeDiagnostics.history = stamp;
+    };
     const fail = (reasonCode, reason, blocked = false) => {
       const tabBlock = blocked ? inspectionBlock() : '';
-      return { id, ready: false, reasonCode, reason, blocked, complete: false, messages: [], ...(tabBlock ? { tabBlock } : {}) };
+      return { id, ready: false, reasonCode, reason, blocked, complete: false, messages: [],
+        timeDiagnostics, ...(tabBlock ? { tabBlock } : {}) };
     };
     const expiresAt = Math.min(request.expiresAt ?? Date.now() + 25_000, job.expiresAt ?? Infinity);
     const minActivityAt = job.minActivityAt ?? Date.now() - dom.recentWindow;
@@ -1065,6 +1078,7 @@
       const search = {};
       const row = lookup(rowKey) || await seekRow(rowKey, job.position, controller.signal, allowed,
         Math.min(expiresAt - 750, Date.now() + 10_000), minActivityAt, Math.max(minActivityAt, job.at ?? minActivityAt), search);
+      if (row?.timeParse) timeDiagnostics.list = row.timeParse;
       if (!row || !row.element.isConnected) {
         const reasonCode = search.reasonCode ?? 'row_unavailable';
         const reason = reasonCode === 'row_time_boundary' ? 'Достигнута граница времени поиска.' :
@@ -1074,10 +1088,11 @@
       if (controller.signal.aborted || !allowed() || !Number.isFinite(row.at) ||
           latestPossibleAt(row) < minActivityAt) return fail('row_unavailable', 'Чат вышел из окна проверки или вкладка занята.', true);
       const expected = request.identity || job.identity;
-      const previousPanel = dom.getChat();
-      const switchChat = !panelMatches(previousPanel, row, expected) || row.selected === false;
+      expectedIdentity = expected || row.rowId;
+      const previousPanel = dom.getChat(recordTime);
+      const switchChat = !panelMatches(previousPanel, row, expected, false, recordTime) || row.selected === false;
       if (switchChat) row.element.click();
-      let chat = await waitPanel(row, expected, controller, null, switchChat ? previousPanel : null, allowed);
+      let chat = await waitPanel(row, expected, controller, null, switchChat ? previousPanel : null, allowed, recordTime);
       if (!chat) return fail('history_unconfirmed', 'Не удалось подтвердить переписку, её автора и время последнего сообщения.',
         controller.signal.aborted || !allowed());
       const sinceAt = request.sinceAt ?? job.sinceAt;
@@ -1090,21 +1105,21 @@
       for (let page = 0; !(coveredPin(chat) && coveredEpisode(chat) && coveredStudent(chat)) && page < 8; page++) {
         if (controller.signal.aborted || !allowed() || Date.now() >= expiresAt - 4_500 || !chat.loadMore?.isConnected) break;
         chat.loadMore.click();
-        const more = await waitPanel(row, chat.id, controller, chat, null, allowed);
+        const more = await waitPanel(row, chat.id, controller, chat, null, allowed, recordTime);
         if (!more) break;
         chat = more;
       }
       if (controller.signal.aborted || !allowed()) return fail('read_error', 'Чтение прервано.', true);
       const latestRow = lookup(rowKey);
-      const latest = dom.getChat();
-      if (ambiguous.has(rowKey) || latestRow?.selected === false || !panelMatches(latest, row, chat.id)) {
+      const latest = dom.getChat(recordTime);
+      if (ambiguous.has(rowKey) || latestRow?.selected === false || !panelMatches(latest, row, chat.id, false, recordTime)) {
         return fail('panel_changed', 'Вкладка или переписка изменилась.');
       }
       const messages = metadata(latest);
       if (messages.at(-1).at >= minActivityAt) watchMinute(latestRow || row, latest.id, job, messages);
       return { id, ready: true, identity: latest.id, startReached: latest.historyComplete,
         ...(typeof latest.assignedToSelf === 'boolean' ? { assignedToSelf: latest.assignedToSelf } : {}),
-        complete: coveredEpisode(latest), sinceCovered: coveredPin(latest), messages };
+        complete: coveredEpisode(latest), sinceCovered: coveredPin(latest), messages, timeDiagnostics };
     } finally {
       if (activeRead === controller) {
         const root = dom.getVirtualList?.();

@@ -14,7 +14,7 @@ const stamp = (offset, minute) => hour(offset) + minute * MINUTE;
 
 function fixture() {
   const context = vm.createContext({ crypto: webcrypto });
-  for (const file of ['engine.js', 'shift-log.js']) {
+  for (const file of ['engine.js', 'time.js', 'shift-log.js']) {
     vm.runInContext(readFileSync(join(__dirname, '../chrome', file), 'utf8'), context, { filename: file });
   }
   const s = { scan: context.ChatEngine.fresh(), checked: 0, notified: 0 };
@@ -112,4 +112,32 @@ test('several delayed confirmations divide buffered counts between successive sh
   assert.equal(third.notified, 0);
   assert.equal(third.events.some(event => event.at === stamp(3, 11)), false);
   assert.equal(third.events.some(event => event.at === recoveredAt && event.event === 'chat_checked'), true);
+});
+
+test('references follow buffered events within a report and rotate at a shift boundary', () => {
+  const { s, log, setRoster } = fixture();
+  const keys = { chatId: 'id:123__456__789', episode: 'private-episode-id', noticeId: 'chrome-internal-notice' };
+  log.diagnostic(s, stamp(0, 2), 'notification_decision', keys, { decision: 'queued' });
+  log.diagnostic(s, stamp(1, 2), 'notification_api_result', keys, { result: 'accepted' });
+  log.diagnostic(s, stamp(3, 5), 'notification_cancelled', keys, { reason: 'episode_changed' });
+  s.shiftLogs = JSON.parse(JSON.stringify(s.shiftLogs));
+  setRoster(hour(3), [CURATOR]);
+  const now = stamp(3, 10);
+  log.observe(s, now, true);
+  assert.equal(log.confirmHour(s, now, hour(1), [CURATOR]), true);
+  assert.equal(log.confirmHour(s, now, hour(2), []), true);
+  log.finish(s, now, 'manual');
+
+  const [first, second] = s.shiftLogs.pending;
+  const queued = first.events.find(entry => entry.event === 'notification_decision').details;
+  const api = first.events.find(entry => entry.event === 'notification_api_result').details;
+  const cancelled = second.events.find(entry => entry.event === 'notification_cancelled').details;
+  for (const field of ['chat_ref', 'episode_ref', 'notification_ref']) {
+    assert.match(queued[field], /^[\da-f-]{36}$/u);
+    assert.equal(api[field], queued[field]);
+    assert.notEqual(cancelled[field], queued[field]);
+  }
+  assert.equal(s.notificationLogIndex, undefined);
+  const exportText = log.render(first, '1.11.7') + log.render(second, '1.11.7');
+  assert.doesNotMatch(exportText, /123__456__789|private-episode-id|chrome-internal-notice|Иван Петров/u);
 });

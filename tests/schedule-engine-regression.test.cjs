@@ -58,7 +58,11 @@ test('startup checks the real message time and leaves normal recency strict', ()
   const minuteRow = { id: 'overlap', title: 'Время до минуты', precision: 'minute', at: MINUTE_START };
   const state = startup([minuteRow]);
   const job = E.next(state, NOW);
-  assert.deepEqual(checkReply(state, job, CUTOFF), {});
+  const check = checkReply(state, job, CUTOFF);
+  assert.equal(check.status, undefined);
+  assert.equal(check.reasonCode, undefined);
+  assert.equal(check.noticeReason, 'last_message_too_old');
+  assert.equal(check.lastAt, CUTOFF);
   assert.equal(state.chats.overlap.pending, null);
   assert.equal(state.chats.overlap.checked, null);
   assert.equal(E.isCheckableChat(minuteRow, MINUTE_START + 20 * MIN), false);

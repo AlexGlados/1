@@ -851,10 +851,43 @@
     return c.transferAt == null && c.freeNotifiedEpisode !== c.waitKey && isFree(c, now);
   }
 
+  function pinnedNoticeBlock(s, c) {
+    if (!c.pinned) return 'chat_unpinned';
+    if (c.transferAt != null) return 'handover_summary';
+    if (s.pinnedImmediate === false) return 'pinned_alerts_disabled';
+    if (s.mode === 'senior' && c.muted) return 'chat_muted';
+    return 'pinned_policy';
+  }
+
+  function immediateSkipReason(s, c, last, pinMessages, now) {
+    if (c.dismissedFree) return 'chat_dismissed';
+    if (!recent(last.at, now)) return 'last_message_too_old';
+    if (c.transferAt != null) return 'handover_summary';
+    if (isFree(c, now) && c.freeNotifiedEpisode === c.waitKey) return 'episode_already_notified';
+    if ((c.binding || c.pinnedColleague) && !c.pinned && s.mode === 'normal') return 'occupied_unpinned';
+    if (isReply(last)) return 'curator_replied';
+    if (c.status === 'Ожидает расписания') return 'schedule_unconfirmed';
+    if (c.pinned) {
+      if (!canNotifyPinned(s, c)) return pinnedNoticeBlock(s, c);
+      return pinMessages.length ? 'pinned_message_too_old' : 'no_new_student_message';
+    }
+    if (!c.waitKey) return 'no_unanswered_question';
+    return c.binding || c.pinnedColleague ? 'occupied_chat' : 'chat_not_free';
+  }
+
   function apply(s, job, history, now, check) {
     const h = history;
     let c = valid(s, job, now);
-    if (!c) return [];
+    if (check) {
+      const observed = c || getChat(s, job?.id);
+      Object.assign(check, { chatId: observed?.id ?? job?.id, episode: observed?.waitKey,
+        lastAt: job?.at, waitSince: observed?.waitSince, ageSource: 'list' });
+    }
+    const skip = reason => {
+      if (check) check.noticeReason = reason;
+      return [];
+    };
+    if (!c) return skip('job_stale');
     const fail = (reasonCode, reason) => {
       if (check) check.reasonCode = reasonCode;
       return retry(c, reason, now);
@@ -878,6 +911,7 @@
     })) {
       return fail('message_time_invalid', 'История не соответствует последней активности.');
     }
+    if (check) Object.assign(check, { lastAt: messages.at(-1).at, ageSource: 'history' });
     if (minute(messages.at(-1).at) < minute(job.at)) {
       return fail('activity_mismatch', 'История не соответствует последней активности.');
     }
@@ -896,7 +930,7 @@
       }
       c.pending = null;
       c.serial++;
-      return [];
+      return skip(recent(last.at, now) ? 'outside_check_window' : 'last_message_too_old');
     }
     if (job.signal != null && !String(job.signal).startsWith('panel:') && last.id != null && minute(last.at) === minute(job.at) &&
         String(job.signal) !== String(last.id)) {
@@ -905,7 +939,8 @@
     if (h.identity) {
       c = identify(s, c, h.identity);
       if (c.identity == null) c.identity = h.identity;
-      if (!c.pending) return [];
+      if (check) check.chatId = c.id;
+      if (!c.pending) return skip('job_stale');
     }
     const participant = list.findLast(message => message.role === 'student' || isReply(message));
     if (participant && (!Number.isFinite(c.lastParticipantAt) || participant.at > c.lastParticipantAt)) {
@@ -917,7 +952,7 @@
       s.inactiveRows ??= {};
       rememberRemoved(s.inactiveRows, c, last.at, last.key, last.id == null ? c.signal : String(last.id));
       delete s.chats[c.id];
-      return [];
+      return skip('student_inactive');
     }
     if (student && !tooOld(student.at, now) && Object.hasOwn(s.inactiveRows ?? {}, c.id)) delete s.inactiveRows[c.id];
     const facts = historyFacts(c, h, list, now);
@@ -925,6 +960,7 @@
     const failure = facts.reason ? facts : pinMessages.reason ? pinMessages : null;
     if (failure) return fail(failure.reasonCode, failure.reason);
     const { reply, wait, lastReplyAt, lastReplyKey } = facts;
+    if (check) Object.assign(check, { episode: wait?.key, waitSince: wait?.at });
     if (student) {
       c.lastStudentKey = student.key;
       c.lastStudentAt = student.at;
@@ -1030,7 +1066,10 @@
       if (duplicate >= 0) result.splice(duplicate, 1);
       result.push(initial);
     }
-    if (check) check.status = c.status;
+    if (check) {
+      check.status = c.status;
+      if (!result.length) check.noticeReason = immediateSkipReason(s, c, last, pinMessages, now);
+    }
     return result;
   }
 
@@ -1095,18 +1134,36 @@
     }
     return out;
   }
-  function noticeEligible(s, n, now) {
-    if (!s.enabled) return false;
-    if (n.kind === 'handover') return handoverAllowed(s, now) && s.handover?.period === n.episode && transfers(s, now).length > 0;
-    const c = getChat(s, n.id);
-    if (!c || c.dismissedFree || !recent(c.lastMessageAt, now)) return false;
-    if (n.phase === 'now' && n.kind === 'pinned') {
-      return canNotifyPinned(s, c) && recent(n.at, now);
+  function noticeIneligibleReason(s, n, now) {
+    if (!s.enabled) return 'monitoring_inactive';
+    if (n.kind === 'handover') {
+      if (!handoverAllowed(s, now)) return 'handover_not_allowed';
+      if (s.handover?.period !== n.episode) return 'episode_changed';
+      return transfers(s, now).length ? '' : 'handover_empty';
     }
-    if (c.activityDirty) return false;
-    if (n.phase === 'now' && n.kind === 'free') return c.transferAt == null && isFree(c, now) && c.waitKey === n.episode;
-    return c.waitKey === n.episode && policy(s, c, now)?.kind === n.kind &&
-      (n.kind !== 'senior' || c.binding?.curator === n.curator);
+    const c = getChat(s, n.id);
+    if (!c) return 'chat_unavailable';
+    if (c.dismissedFree) return 'chat_dismissed';
+    if (!recent(c.lastMessageAt, now)) return 'last_message_too_old';
+    if (n.phase === 'now' && n.kind === 'pinned') {
+      if (!canNotifyPinned(s, c)) return pinnedNoticeBlock(s, c);
+      return recent(n.at, now) ? '' : 'pinned_message_too_old';
+    }
+    if (c.activityDirty) return 'new_activity_before_send';
+    if (c.waitKey !== n.episode) {
+      return Number.isFinite(c.lastReplyAt) && c.lastReplyAt >= n.at ? 'curator_replied' : 'episode_changed';
+    }
+    if (n.phase === 'now' && n.kind === 'free') {
+      if (c.transferAt != null) return 'handover_summary';
+      if (waitingSince(c, now) === null) return 'wait_expired';
+      return isFree(c, now) ? '' : 'chat_not_free';
+    }
+    if (n.kind === 'senior' && c.muted) return 'chat_muted';
+    if (policy(s, c, now)?.kind !== n.kind) return 'reminder_policy_changed';
+    return n.kind === 'senior' && c.binding?.curator !== n.curator ? 'curator_changed' : '';
+  }
+  function noticeEligible(s, n, now) {
+    return noticeIneligibleReason(s, n, now) === '';
   }
   function noticeNeedsRecheck(s, n, now) {
     if (n.kind !== 'free' || n.phase !== 'now') return false;
@@ -1158,7 +1215,7 @@
   const api = { fresh, start, stop, finish, advance, prepareStartup, periodAt, calendarPeriodAt, calendarSchedule,
     boundary, prefetchTime, scheduleTarget, installRoster, curatorDuty,
     observe, reconcileRows, panelChanged, earliest, next, defer, apply, navigation,
-    setMode, setPinnedInstant, dueNotices, nextNoticeAt, noticeEligible, noticeNeedsRecheck, noticeDelivered,
+    setMode, setPinnedInstant, dueNotices, nextNoticeAt, noticeEligible, noticeIneligibleReason, noticeNeedsRecheck, noticeDelivered,
     setChatMute, unbind, isFree, freeVersion, dismissFree,
     waitingSince, isRecentChat: inWindow, isCheckableChat: inCheckWindow, isStartupActivity };
   globalThis.ChatEngine = api;

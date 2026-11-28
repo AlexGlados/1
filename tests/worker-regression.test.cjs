@@ -192,6 +192,7 @@ const freeRow = (at, signal) => ({
 });
 const student = (id, at) => ({ id, at, role: 'student', author: 'Fixture' });
 const freeHistory = (id, ...messages) => ({ id, identity: '1__2__3', ready: true, startReached: true, complete: true, messages });
+const logged = (f, event) => f.saved().shiftLogs.active.events.filter(entry => entry.event === event).map(entry => entry.details);
 
 for (const role of ['student', 'staff']) {
   test('queued free alert waits for a confirmed new ' + role + ' message', async () => {
@@ -205,6 +206,11 @@ for (const role of ['student', 'staff']) {
     await settle();
     const [queuedId] = Object.keys(f.saved().outbox);
     assert.ok(queuedId);
+    const [queued] = logged(f, 'notification_decision');
+    assert.equal(queued.decision, 'queued');
+    assert.equal(queued.reason, 'free_chat_confirmed');
+    assert.equal(queued.chat_ref, logged(f, 'chat_checked')[0].chat_ref);
+    assert.equal(queued.episode_ref, logged(f, 'chat_checked')[0].episode_ref);
 
     f.advance(1000);
     const next = { id: 'next', at: START + 1000, role, author: role === 'staff' ? 'Иван Петров' : 'Fixture' };
@@ -214,6 +220,11 @@ for (const role of ['student', 'staff']) {
     assert.deepEqual(Object.keys(f.saved().outbox), [queuedId]);
     assert.deepEqual(Object.keys(f.notifications), []);
     assert.equal(f.saved().scan.chats[FREE_CHAT_ID].freeNotifiedEpisode, undefined);
+    await f.plan();
+    const [deferred] = logged(f, 'notification_deferred');
+    assert.equal(logged(f, 'notification_deferred').length, 1);
+    assert.equal(deferred.reason, 'new_activity_before_send');
+    assert.equal(deferred.notification_ref, queued.notification_ref);
 
     recheck.resolve(freeHistory(FREE_CHAT_ID, first, next));
     await settle();
@@ -222,6 +233,24 @@ for (const role of ['student', 'staff']) {
     assert.deepEqual(Object.keys(f.saved().outbox), []);
     assert.deepEqual(Object.keys(f.notifications), role === 'student' ? [queuedId] : []);
     assert.equal(f.saved().scan.chats[FREE_CHAT_ID].freeNotifiedEpisode, role === 'student' ? 'id:first' : undefined);
+    if (role === 'student') {
+      const [result] = logged(f, 'notification_api_result');
+      assert.equal(result.operation, 'create');
+      assert.equal(result.result, 'accepted');
+      assert.equal(result.notification_ref, queued.notification_ref);
+      assert.equal(logged(f, 'notification_cancelled').length, 0);
+      const skipped = logged(f, 'notification_decision').at(-1);
+      assert.equal(skipped.reason, 'already_queued');
+      assert.equal(skipped.notification_ref, queued.notification_ref);
+      assert.equal(skipped.last_message_age_ms, 0);
+      assert.equal(skipped.wait_duration_ms, 1000);
+    } else {
+      const [cancelled] = logged(f, 'notification_cancelled');
+      assert.equal(cancelled.reason, 'curator_replied');
+      assert.equal(cancelled.notification_ref, queued.notification_ref);
+      assert.equal(logged(f, 'notification_api_result').length, 0);
+    }
+    assert.doesNotMatch(JSON.stringify(f.saved().shiftLogs), /1__2__3|id:first|Fixture|Иван Петров|shkolkovo-[a-f0-9]/u);
   });
 }
 
@@ -247,6 +276,12 @@ test('a second student message after a delivered free alert does not repeat the 
   await settle();
   assert.deepEqual(Object.keys(f.notifications), [deliveredId]);
   assert.equal(f.saved().notified, 1);
+  const [queued, skipped] = logged(f, 'notification_decision');
+  assert.equal(skipped.decision, 'skipped');
+  assert.equal(skipped.reason, 'episode_already_notified');
+  assert.equal(skipped.episode_ref, queued.episode_ref);
+  assert.equal(skipped.last_message_age_ms, 0);
+  assert.equal(skipped.wait_duration_ms, 1000);
 });
 
 test('a pending first free alert keeps the retry and absorbs reminder thresholds on delivery', async () => {
@@ -255,7 +290,7 @@ test('a pending first free alert keeps the retry and absorbs reminder thresholds
   let attempts = 0;
   f.controls.read = ({ id }) => freeHistory(id, first);
   f.controls.beforeNotification = () => {
-    if (++attempts === 1) throw new Error('notification failed');
+    if (++attempts === 1) throw new Error('Permission denied for private details');
   };
   await f.rows([freeRow(first.at, first.id)]);
   await f.plan();
@@ -278,6 +313,12 @@ test('a pending first free alert keeps the retry and absorbs reminder thresholds
   assert.deepEqual(Object.keys(f.notifications), [queuedId]);
   assert.equal(attempts, 2);
   assert.equal(f.saved().scan.chats[FREE_CHAT_ID].remindedMinute, 5);
+  const [rejected, accepted] = logged(f, 'notification_api_result');
+  assert.equal(rejected.result, 'rejected');
+  assert.equal(rejected.error_code, 'permission_denied');
+  assert.equal(accepted.result, 'accepted');
+  assert.equal(rejected.notification_ref, accepted.notification_ref);
+  assert.doesNotMatch(JSON.stringify(f.saved().shiftLogs), /private details/u);
 });
 
 test('a free alert expires at exactly twenty minutes if it has not been delivered', async () => {
@@ -294,6 +335,37 @@ test('a free alert expires at exactly twenty minutes if it has not been delivere
   await settle();
   assert.deepEqual(Object.keys(f.saved().outbox), []);
   assert.deepEqual(Object.keys(f.notifications), []);
+  const [cancelled] = logged(f, 'notification_cancelled');
+  assert.equal(cancelled.reason, 'last_message_too_old');
+  assert.equal(cancelled.notification_ref, logged(f, 'notification_decision')[0].notification_ref);
+});
+
+test('a queued reminder removed after new activity records the cancellation cause', async () => {
+  const f = fixture();
+  const first = student('first', START);
+  f.controls.read = ({ id }) => freeHistory(id, first);
+  await f.rows([freeRow(first.at, first.id)]);
+  await f.plan();
+  await settle();
+  await f.plan();
+  await settle();
+
+  f.advance(5 * MINUTE);
+  f.controls.beforeNotification = () => { throw new Error('notification failed'); };
+  await f.plan();
+  await settle();
+  const reminder = logged(f, 'notification_decision').find(entry => entry.phase === 'reminder');
+  assert.ok(reminder);
+
+  f.advance(1000);
+  const next = student('next', START + 5 * MINUTE + 1000);
+  f.controls.read = ({ id }) => freeHistory(id, first, next);
+  await f.rows([freeRow(next.at, next.id)]);
+  await f.plan();
+  await settle();
+  const [cancelled] = logged(f, 'notification_cancelled');
+  assert.equal(cancelled.reason, 'new_activity_before_send');
+  assert.equal(cancelled.notification_ref, reminder.notification_ref);
 });
 
 test('an accepted free alert is recorded once after its first storage write fails', async () => {
@@ -321,6 +393,96 @@ test('an accepted free alert is recorded once after its first storage write fail
   assert.equal(f.saved().notified, 1);
   assert.equal(f.saved().scan.chats[FREE_CHAT_ID].freeNotifiedEpisode, 'id:first');
   assert.deepEqual(Object.keys(f.saved().outbox), []);
+  const [present] = logged(f, 'notification_api_result');
+  assert.equal(present.result, 'already_present');
+  assert.equal(present.operation, 'get_all');
+});
+
+test('a checked free chat records different last-message and waiting ages when the alert is too old', async () => {
+  const f = fixture();
+  const first = student('first', START - 30 * MINUTE);
+  const last = student('last', START - 20 * MINUTE);
+  f.controls.read = ({ id }) => freeHistory(id, first, last);
+  await f.rows([freeRow(last.at, last.id)]);
+  await f.plan();
+  await settle();
+  assert.equal(logged(f, 'chat_checked')[0].status, 'Свободен');
+  const [decision] = logged(f, 'notification_decision');
+  assert.equal(decision.decision, 'skipped');
+  assert.equal(decision.reason, 'last_message_too_old');
+  assert.equal(decision.last_message_age_ms, 20 * MINUTE);
+  assert.equal(decision.wait_duration_ms, 30 * MINUTE);
+  assert.equal(decision.age_source, 'history');
+  assert.deepEqual(Object.keys(f.saved().outbox), []);
+});
+
+test('an occupied unpinned chat explains a skipped notice', async () => {
+  const f = fixture();
+  const reply = { id: 'reply', at: START - MINUTE, role: 'staff', author: 'Иван Петров' };
+  const question = student('question', START);
+  f.controls.read = ({ id }) => freeHistory(id, reply, question);
+  await f.rows([freeRow(question.at, question.id)]);
+  await f.plan();
+  await settle();
+  assert.equal(logged(f, 'chat_checked')[0].status, 'Занят');
+  assert.equal(logged(f, 'notification_decision')[0].reason, 'occupied_unpinned');
+  assert.deepEqual(Object.keys(f.saved().outbox), []);
+});
+
+test('time diagnostics are linked and accept only fixed fields from the tab', async () => {
+  const f = fixture();
+  const first = student('first', START);
+  f.controls.read = ({ id }) => ({ ...freeHistory(id, first), timeDiagnostics: {
+    list: { source: 'text', precision: 'minute', timezone: 'assumed_local', offsetMinutes: 120, at: START,
+      rejected: [{ source: 'title', reason: 'displayed_minute_mismatch', deltaMs: HOUR, label: 'private date label' }] },
+    history: { source: 'datetime', precision: 'exact', timezone: 'explicit', offsetMinutes: 120, at: START,
+      label: 'private time label', rejected: [{ source: 'title', reason: 'private rejection description', deltaMs: 120 }] }
+  } });
+  await f.rows([freeRow(first.at, first.id)]);
+  await f.plan();
+  await settle();
+  const [list, history] = logged(f, 'message_time_parsed');
+  const [decision] = logged(f, 'notification_decision');
+  assert.deepEqual([list.surface, list.source, list.precision, list.timezone_source, list.offset_minutes],
+    ['list', 'text', 'minute', 'assumed_local', 120]);
+  assert.deepEqual(list.rejected_exact, [{ source: 'title', reason: 'displayed_minute_mismatch', delta_ms: HOUR }]);
+  assert.deepEqual([history.surface, history.source, history.precision, history.timezone_source, history.offset_minutes],
+    ['history', 'datetime', 'exact', 'explicit', 120]);
+  assert.equal(history.timestamp_utc, new Date(START).toISOString());
+  assert.equal(history.chat_ref, decision.chat_ref);
+  assert.equal(list.episode_ref, decision.episode_ref);
+  assert.equal(history.rejected_exact, undefined);
+  assert.doesNotMatch(JSON.stringify(f.saved().shiftLogs), /private|Fixture|1__2__3/u);
+});
+
+test('the startup cutoff records a list timestamp even when there is no chat read', async () => {
+  const f = fixture();
+  const at = START - 50 * MINUTE;
+  f.state.scan.startupCutoff = START - 45 * MINUTE;
+  await f.report({ complete: true, rows: [], timeBoundary: {
+    id: FREE_CHAT_ID, at, timeParse: { source: 'text', precision: 'minute', timezone: 'assumed_local', at, offsetMinutes: 120 }
+  } });
+  const [decision] = logged(f, 'notification_decision');
+  const [time] = logged(f, 'message_time_parsed');
+  assert.equal(decision.reason, 'outside_startup_window');
+  assert.equal(decision.age_source, 'list');
+  assert.equal(decision.last_message_age_ms, 50 * MINUTE);
+  assert.equal(decision.chat_ref, time.chat_ref);
+  assert.deepEqual(f.reads, []);
+});
+
+test('the test button records a separate Chrome result without touching chat counts', async () => {
+  const f = fixture();
+  assert.equal((await f.popup('ui:test')).ok, true);
+  f.controls.beforeNotification = () => { throw new Error('Notifications are disabled for private profile details'); };
+  assert.equal((await f.popup('ui:test')).ok, false);
+  const [accepted, rejected] = logged(f, 'notification_api_result');
+  assert.deepEqual([accepted.kind, accepted.result], ['test', 'accepted']);
+  assert.deepEqual([rejected.kind, rejected.result, rejected.error_code], ['test', 'rejected', 'notifications_disabled']);
+  assert.notEqual(accepted.notification_ref, rejected.notification_ref);
+  assert.equal(accepted.chat_ref, undefined);
+  assert.equal(f.saved().notified, 0);
+  assert.doesNotMatch(JSON.stringify(f.saved().shiftLogs), /private profile|shkolkovo-test/u);
 });
 
 test('the next pass delivers after the planner fails to persist its state', async () => {
@@ -465,7 +627,9 @@ test('a rejected ready history logs a reason code without the chat or message me
   await settle();
   const failure = f.saved().shiftLogs.active.events.find(event => event.event === 'chat_check_failed');
   assert.equal(failure.details.reason, 'message_id_missing');
-  assert.deepEqual(Object.keys(failure.details), ['reason']);
+  assert.deepEqual(Object.keys(failure.details).sort(), ['chat_ref', 'reason']);
+  assert.equal(failure.details.chat_ref, logged(f, 'notification_decision')[0].chat_ref);
+  assert.doesNotMatch(JSON.stringify(f.saved().shiftLogs), /1__2__3|Fixture name|Fixture title/u);
   assert.equal(f.saved().checked, 0);
 });
 

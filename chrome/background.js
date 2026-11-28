@@ -221,18 +221,50 @@ async function tabBlockReason(id) {
 function notification(title, message) {
   return { type: 'basic', iconUrl: 'icon.png', title, message };
 }
-function addNotice(s, item) {
+function trackedChat(s, id) {
+  return id && Object.hasOwn(s.scan.chats, id) ? s.scan.chats[id] : null;
+}
+function decisionTimes(now, lastAt, waitSince, ageSource) {
+  return {
+    last_message_age_ms: Number.isFinite(lastAt) ? now - lastAt : null,
+    wait_duration_ms: Number.isFinite(waitSince) ? now - waitSince : null,
+    age_source: Number.isFinite(lastAt) ? ageSource : null
+  };
+}
+function noticeTrace(s, now, event, id, item, details) {
+  shiftLog.diagnostic(s, now, event, {
+    chatId: item.id, episode: item.episode ?? item.since, noticeId: id, kind: item.kind
+  }, { kind: item.kind, ...(item.phase ? { phase: item.phase } : {}), ...details });
+}
+const queuedReasons = {
+  free: 'free_chat_confirmed', pinned: 'new_pinned_message', handover: 'handover_confirmed',
+  offline: 'offline_confirmed', connecting: 'connecting_confirmed'
+};
+function addNotice(s, item, now = Date.now()) {
+  const chat = trackedChat(s, item.id);
+  const times = decisionTimes(now, chat?.lastMessageAt, chat?.waitSince, 'history');
   for (const [id, queued] of Object.entries(s.outbox)) {
     if (item.kind !== queued.kind || item.id !== queued.id) continue;
-    if (item.key && item.key === queued.key) return;
-    if (item.phase === 'reminder' && item.episode === queued.episode) removeNotice(s, id);
+    if (item.key && item.key === queued.key) {
+      noticeTrace(s, now, 'notification_decision', id, queued, { decision: 'skipped', reason: 'already_queued', ...times });
+      return;
+    }
+    if (item.phase === 'reminder' && item.episode === queued.episode) removeNotice(s, id, 'superseded_by_reminder', now);
   }
   const id = 'shkolkovo-' + crypto.randomUUID();
   s.outbox[id] = { ...item, tab: s.tab, session: token(s), retryAt: 0 };
+  const reason = item.phase === 'reminder' ? 'reminder_due' : queuedReasons[item.kind];
+  noticeTrace(s, now, 'notification_decision', id, item, { decision: 'queued', reason, ...times });
 }
-function removeNotice(s, id) {
+function removeNotice(s, id, reason, now = Date.now()) {
+  if (reason && s.outbox[id]) noticeTrace(s, now, 'notification_cancelled', id, s.outbox[id], { reason });
   delete s.outbox[id];
   if (!Object.values(s.outbox).some(n => n.retryAt > 0)) s.error = '';
+}
+function deferNotice(s, id, item, now, reason) {
+  if (item.deferredReason === reason) return;
+  item.deferredReason = reason;
+  noticeTrace(s, now, 'notification_deferred', id, item, { reason });
 }
 function connectionDelay(connection) {
   if (connection.status === 'offline' && connection.onlineSeen) return 2_000;
@@ -254,7 +286,7 @@ function connection(s, status, verified = false) {
     c.alerted = false;
   } else if (previous === 'unknown' && !c.alerted) c.since = now;
   if (!s.doc || c.alerted || !verified || now - c.since < connectionDelay(c)) return;
-  addNotice(s, { kind: status, since: c.since, doc: s.doc });
+  addNotice(s, { kind: status, since: c.since, doc: s.doc }, now);
   c.alerted = true;
 }
 
@@ -295,15 +327,30 @@ async function alarm(name, when) {
     await chrome.alarms.create(name, { when });
   }
 }
-function noticeState(s, n, now) {
-  if (!monitoring(s) || n.tab !== s.tab || n.session !== token(s)) return 'obsolete';
+function noticeBlock(s, n, now) {
+  if (!monitoring(s)) return 'monitoring_inactive';
+  if (n.tab !== s.tab || n.session !== token(s)) return 'session_changed';
   if (n.kind === 'offline' || n.kind === 'connecting') {
     const c = s.connection;
     const sameEpisode = n.kind === c.status || (n.kind === 'offline' && c.status === 'unknown' && c.episode === 'offline');
-    return s.doc && n.doc === s.doc && sameEpisode && n.since === c.since ? 'ready' : 'obsolete';
+    if (!s.doc || n.doc !== s.doc) return 'document_changed';
+    return sameEpisode && n.since === c.since ? '' : 'connection_changed';
   }
-  if (E.noticeEligible(s.scan, n, now)) return 'ready';
-  return E.noticeNeedsRecheck(s.scan, n, now) ? 'recheck' : 'obsolete';
+  const reason = E.noticeIneligibleReason(s.scan, n, now);
+  return reason && E.noticeNeedsRecheck(s.scan, n, now) ? 'recheck' : reason;
+}
+function noticeReady(s, id, item, now) {
+  const reason = noticeBlock(s, item, now);
+  if (reason === 'recheck') {
+    deferNotice(s, id, item, now, 'new_activity_before_send');
+    return false;
+  }
+  if (reason) {
+    removeNotice(s, id, reason, now);
+    return false;
+  }
+  if (item.deferredReason === 'new_activity_before_send') delete item.deferredReason;
+  return true;
 }
 
 function addRows(s, result, startupCutoff = s.scan.startupCutoff) {
@@ -644,13 +691,11 @@ async function plan() {
       actions.push(() => readSchedule(generation, target));
     }
     for (const retry of [calendar.retryAt, s.scan.scheduleRetryAt, s.scan.prefetchRetryAt]) if (retry > now) times.push(retry);
-    for (const item of E.dueNotices(s.scan, now)) addNotice(s, item);
+    for (const item of E.dueNotices(s.scan, now)) addNotice(s, item, now);
     const noticeAt = E.nextNoticeAt(s.scan, now);
     if (noticeAt > now) times.push(noticeAt);
     for (const [id, item] of Object.entries(s.outbox)) {
-      const state = noticeState(s, item, now);
-      if (state === 'obsolete') removeNotice(s, id);
-      if (state !== 'ready') continue;
+      if (!noticeReady(s, id, item, now)) continue;
       if (item.retryAt > now) { times.push(item.retryAt); continue; }
       if (!runningDelivery) {
         runningDelivery = id;
@@ -834,9 +879,15 @@ async function readChat(ref, job) {
     try {
       if (history) await tx(s => {
         if (!current(s, ref)) return;
+        const now = Date.now();
+        const check = {};
+        let notices = [];
         if (history.blocked) {
-          const now = Date.now();
-          if (TAB_BLOCKS.has(history.tabBlock)) {
+          const reason = TAB_BLOCKS.has(history.tabBlock) ? history.tabBlock : 'job_changed';
+          const chat = trackedChat(s, job.id);
+          Object.assign(check, { chatId: job.id, episode: chat?.waitKey,
+            lastAt: job.at, waitSince: chat?.waitSince, ageSource: 'list', noticeReason: reason });
+          if (reason !== 'job_changed') {
             if (s.tabBlock?.reason !== history.tabBlock) {
               shiftLog.record(s, now, 'chat_check_deferred', { reason: history.tabBlock });
             }
@@ -848,20 +899,28 @@ async function readChat(ref, job) {
             E.defer(s.scan, job, now, TAB_RETRY);
             shiftLog.record(s, now, 'chat_check_deferred', { reason: 'job_changed' });
           }
-          return;
+        } else {
+          if (s.tabBlock) {
+            shiftLog.record(s, now, 'chat_checks_resumed', { previousReason: s.tabBlock.reason });
+            s.tabBlock = null;
+          }
+          notices = E.apply(s.scan, job, history, now, check);
+          shiftLog.identifyChat(s, job.id, check.chatId);
         }
-        if (s.tabBlock) {
-          shiftLog.record(s, Date.now(), 'chat_checks_resumed', { previousReason: s.tabBlock.reason });
-          s.tabBlock = null;
-        }
-        const check = {};
-        for (const n of E.apply(s.scan, job, history, Date.now(), check)) addNotice(s, { ...n, period: job.period });
+        const keys = { chatId: check.chatId, episode: check.episode };
+        shiftLog.parsedTime(s, now, keys, 'list', history.timeDiagnostics?.list);
+        shiftLog.parsedTime(s, now, keys, 'history', history.timeDiagnostics?.history);
         if (check.status) {
           s.checked = (s.checked || 0) + 1;
-          shiftLog.record(s, Date.now(), 'chat_checked', { status: check.status, pinned: job.pinned === true });
+          shiftLog.diagnostic(s, now, 'chat_checked', keys, { status: check.status, pinned: job.pinned === true });
         } else if (check.reasonCode) {
-          shiftLog.record(s, Date.now(), 'chat_check_failed', { reason: check.reasonCode });
+          shiftLog.diagnostic(s, now, 'chat_check_failed', keys, { reason: check.reasonCode });
         }
+        if (check.reasonCode || check.noticeReason) {
+          shiftLog.diagnostic(s, now, 'notification_decision', keys, { decision: 'skipped',
+            reason: check.reasonCode ?? check.noticeReason, ...decisionTimes(now, check.lastAt, check.waitSince, check.ageSource) });
+        }
+        for (const n of notices) addNotice(s, { ...n, period: job.period }, now);
       });
     } finally { if (runningRead === ref) runningRead = null; kick(); }
   }
@@ -924,19 +983,42 @@ function noticeCopy(n) {
 function handoverCount(scan, now) {
   return Object.values(scan.chats).filter(c => c.transferAt != null && E.isFree(c, now)).length;
 }
+function notificationErrorCode(error) {
+  const message = typeof error?.message === 'string' ? error.message : '';
+  if (/notifications? (?:are |is )?(?:disabled|blocked)/iu.test(message)) return 'notifications_disabled';
+  if (error?.name === 'NotAllowedError' || /permission|not allowed|access denied/iu.test(message)) return 'permission_denied';
+  if (error?.name === 'TypeError' || /invalid|missing required/iu.test(message)) return 'invalid_options';
+  if (error?.name === 'NotSupportedError' || /unavailable|not supported/iu.test(message)) return 'unavailable';
+  return 'chrome_api_error';
+}
+async function createLoggedNotification(s, id, item, options, reference = id) {
+  try {
+    await chrome.notifications.create(id, options);
+  } catch (error) {
+    noticeTrace(s, Date.now(), 'notification_api_result', reference, item,
+      { operation: 'create', result: 'rejected', error_code: notificationErrorCode(error) });
+    throw error;
+  }
+  noticeTrace(s, Date.now(), 'notification_api_result', reference, item, { operation: 'create', result: 'accepted' });
+}
 async function deliver(id) {
   try {
     await tx(async s => {
       const n = s.outbox[id];
       if (!n || !monitoring(s)) return;
       try {
-        const existing = await chrome.notifications.getAll();
+        let existing;
+        try {
+          existing = await chrome.notifications.getAll();
+        } catch (error) {
+          noticeTrace(s, Date.now(), 'notification_api_result', id, n,
+            { operation: 'get_all', result: 'rejected', error_code: notificationErrorCode(error) });
+          throw error;
+        }
         // Recheck the episode immediately before submitting, including after a delayed alarm.
         const now = Date.now();
         E.advance(s.scan, now);
-        const state = noticeState(s, n, now);
-        if (state === 'obsolete') removeNotice(s, id);
-        if (state !== 'ready') return;
+        if (!noticeReady(s, id, n, now)) return;
         if (!Object.hasOwn(existing, id)) {
           if (n.kind === 'offline') {
             const tab = await chrome.tabs.get(n.tab).catch(() => null);
@@ -945,10 +1027,11 @@ async function deliver(id) {
             const status = snapshot?.connection;
             if (status === 'online' || status === 'connecting') {
               connection(s, status);
-              removeNotice(s, id);
+              removeNotice(s, id, 'connection_recovered', now);
               return;
             }
             if (status !== 'offline') {
+              deferNotice(s, id, n, now, 'connection_unconfirmed');
               n.retryAt = Date.now() + 5000;
               return;
             }
@@ -957,18 +1040,18 @@ async function deliver(id) {
           if (n.kind === 'handover') latest.count = handoverCount(s.scan, now);
           if (n.phase === 'reminder' && Number.isFinite(n.at)) latest.minutes = Math.max(0, Math.floor((now - n.at) / MIN));
           const [title, message] = noticeCopy(latest);
-          await chrome.notifications.create(id, notification(title, message));
-        }
+          await createLoggedNotification(s, id, n, notification(title, message));
+        } else noticeTrace(s, now, 'notification_api_result', id, n, { operation: 'get_all', result: 'already_present' });
         const deliveredAt = Date.now();
         E.noticeDelivered(s.scan, n, deliveredAt);
         s.routes[id] = { tab: n.tab, id: n.id || null, kind: n.kind, boot: bootId };
         if (n.kind !== 'offline' && n.kind !== 'connecting') s.notified = (s.notified || 0) + 1;
-        shiftLog.record(s, deliveredAt, 'notification_delivered', { kind: n.kind, phase: n.phase });
+        noticeTrace(s, deliveredAt, 'notification_delivered', id, n, {});
         removeNotice(s, id);
       } catch {
         n.retryAt = Date.now() + MIN;
         s.error = 'Chrome не показал уведомление. Следующая попытка через минуту.';
-        shiftLog.record(s, Date.now(), 'notification_retry', { kind: n.kind, phase: n.phase });
+        noticeTrace(s, Date.now(), 'notification_retry', id, n, { retry_after_ms: MIN });
       }
     });
   } finally { runningDelivery = null; kick(); }
@@ -1037,6 +1120,15 @@ async function tabMessage(m, sender) {
           s.scan.baseline = true;
           s.scan.coveragePending = false;
           s.syncAt = Math.max(s.syncAt ?? 0, Date.now() + MIN);
+          const boundary = m.timeBoundary;
+          const now = Date.now();
+          if (typeof boundary?.id === 'string' && boundary.id && Number.isFinite(boundary.at) && boundary.at <= startupCutoff) {
+            const chatId = /^\d+__\d+__\d+$/u.test(boundary.identity ?? '') ? 'id:' + boundary.identity : boundary.id;
+            const keys = { chatId };
+            shiftLog.parsedTime(s, now, keys, 'list', boundary.timeParse);
+            shiftLog.diagnostic(s, now, 'notification_decision', keys, { decision: 'skipped',
+              reason: 'outside_startup_window', ...decisionTimes(now, boundary.at, null, 'list') });
+          }
         }
         const count = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
         const complete = m.complete;
@@ -1193,7 +1285,7 @@ async function dismissFree(id, version) {
     for (const [key, item] of Object.entries(s.outbox)) {
       if (!matches(item)) continue;
       noticeIds.add(key);
-      removeNotice(s, key);
+      removeNotice(s, key, 'chat_dismissed', now);
     }
     for (const [key, item] of Object.entries(s.routes)) {
       if (!matches(item)) continue;
@@ -1209,9 +1301,16 @@ async function dismissFree(id, version) {
 }
 async function popupMessage(m) {
   if (m.type === 'ui:test') {
-    if (!await tx(s => Boolean(s.scan.curatorName))) return { ok: false, error: curatorRequiredMessage };
-    await chrome.notifications.create('shkolkovo-test', notification('Школково — тест', timeLabel(Date.now())));
-    return { ok: true };
+    return tx(async s => {
+      if (!s.scan.curatorName) return { ok: false, error: curatorRequiredMessage };
+      try {
+        await createLoggedNotification(s, 'shkolkovo-test', { kind: 'test' },
+          notification('Школково — тест', timeLabel(Date.now())), crypto.randomUUID());
+        return { ok: true };
+      } catch {
+        return { ok: false, error: 'Chrome не принял тестовое уведомление.' };
+      }
+    });
   }
   if (m.type === 'ui:status') {
     const [state, update] = await Promise.all([details(m.tabId), updates.status().catch(() => null)]);
@@ -1288,8 +1387,10 @@ async function popupMessage(m) {
       const curatorName = s.scan.curatorName;
       const notices = m.type === 'ui:finish' ? [...Object.keys(s.routes), ...Object.keys(s.outbox)] : [];
       if (m.type === 'ui:finish') {
+        const now = Date.now();
+        for (const id of Object.keys(s.outbox)) removeNotice(s, id, 'shift_finished', now);
         const count = E.finish(s.scan);
-        shiftLog.finish(s, Date.now(), 'manual', { clearedBindings: count });
+        shiftLog.finish(s, now, 'manual', { clearedBindings: count });
         const scan = s.scan;
         const lastWatchTab = s.lastWatchTab;
         Object.assign(s, blank(), { scan, boot: bootId, lastWatchTab, result: 'Смена завершена. Удалено привязок — ' + count });

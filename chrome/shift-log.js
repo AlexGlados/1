@@ -5,6 +5,10 @@
   const MAX_EVENTS = 1200;
   const DUTY_MATCH_VERSION = 1;
   const engine = globalThis.ChatEngine;
+  const referenceFields = ['chat_ref', 'episode_ref', 'notification_ref'];
+  const timeSources = ['datetime', 'title', 'text'];
+  const timeReasons = ['invalid_timestamp', 'future_timestamp', 'displayed_minute_unconfirmed',
+    'displayed_minute_mismatch', 'displayed_precision_preferred'];
 
   function journal(s) {
     return s.shiftLogs ??= { active: null, pending: [] };
@@ -64,11 +68,70 @@
     }
   }
 
-  function begin(s, now) {
+  function diagnostic(s, at, event, { chatId, episode, noticeId, kind }, details) {
+    if (!s.shiftLogs?.active && !(at >= s.shiftLogs?.review?.period)) return;
+    // Keep the identity lookup in local monitoring state, outside journal entries and reports.
+    const index = s.notificationLogIndex ??= {};
+    const reference = (...parts) => index[JSON.stringify(parts)] ??= crypto.randomUUID();
+    const chatRef = chatId ? reference('chat', chatId) : null;
+    const refs = {
+      ...(chatRef ? { chat_ref: chatRef } : {}),
+      ...(episode != null ? { episode_ref: reference('episode', chatRef ?? kind, episode) } : {}),
+      ...(noticeId ? { notification_ref: reference('notification', noticeId) } : {})
+    };
+    record(s, at, event, { ...refs, ...details });
+  }
+
+  function identifyChat(s, rowId, chatId) {
+    const index = s.notificationLogIndex;
+    if (!index || !chatId || rowId === chatId) return;
+    const rowKey = JSON.stringify(['chat', rowId]);
+    if (!index[rowKey]) return;
+    index[JSON.stringify(['chat', chatId])] ??= index[rowKey];
+    delete index[rowKey];
+  }
+
+  function parsedTime(s, at, refs, surface, stamp) {
+    if (!timeSources.includes(stamp?.source)) return;
+    const utc = Number.isSafeInteger(stamp.at) && Math.abs(stamp.at) <= 8.64e15 ? new Date(stamp.at).toISOString() : null;
+    const rejected = [];
+    for (const item of Array.isArray(stamp.rejected) ? stamp.rejected.slice(0, 2) : []) {
+      if (!['datetime', 'title'].includes(item?.source) || !timeReasons.includes(item.reason)) continue;
+      rejected.push({ source: item.source, reason: item.reason, delta_ms: Number.isSafeInteger(item.deltaMs) ? item.deltaMs : null });
+    }
+    diagnostic(s, at, 'message_time_parsed', refs, {
+      surface, source: stamp.source, precision: ['exact', 'minute', 'day'].includes(stamp.precision) ? stamp.precision : null,
+      timezone_source: ['explicit', 'assumed_local'].includes(stamp.timezone) ? stamp.timezone : null,
+      offset_minutes: Number.isInteger(stamp.offsetMinutes) && Math.abs(stamp.offsetMinutes) < 1440 ? stamp.offsetMinutes : null,
+      timestamp_utc: utc, ...(timeReasons.includes(stamp.reason) ? { reason: stamp.reason } : {}),
+      ...(rejected.length ? { rejected_exact: rejected } : {})
+    });
+  }
+
+  function reportReferences(events) {
+    // Buffered hours can move to a different shift. Scope their references to the
+    // actual report when it closes so exports cannot be linked across shifts.
+    const scoped = new Map();
+    return events.map(entry => {
+      if (!entry.details || !referenceFields.some(field => entry.details[field])) return entry;
+      const details = { ...entry.details };
+      for (const field of referenceFields) {
+        const original = details[field];
+        if (!original) continue;
+        if (!scoped.has(original)) scoped.set(original, crypto.randomUUID());
+        details[field] = scoped.get(original);
+      }
+      return { ...entry, details };
+    });
+  }
+
+  function begin(s, now, held) {
+    if (!held) delete s.notificationLogIndex;
     const log = journal(s).active = {
       id: crypto.randomUUID(), openedAt: now, firstDutyPeriod: null, lastDutyPeriod: null,
       nextOnDuty: null, dutyMatchVersion: DUTY_MATCH_VERSION,
-      initialChecked: s.checked || 0, initialNotified: s.notified || 0, events: [], omitted: 0
+      initialChecked: s.checked || 0, initialNotified: s.notified || 0, events: [], omitted: 0,
+      ...(held ? { held } : {})
     };
     record(s, now, 'monitor_started', { mode: s.scan.mode, pinnedInstant: s.scan.pinnedImmediate !== false });
     return log;
@@ -85,8 +148,7 @@
     delete s.shiftLogs.review;
     const first = held.hours[period];
     const earliest = first?.firstAt ?? held.events.find(event => engine.calendarPeriodAt(event.at) === period)?.at ?? period;
-    const log = begin(s, Math.min(now, earliest));
-    log.held = held;
+    const log = begin(s, Math.min(now, earliest), held);
     for (const totals of Object.values(held.hours)) {
       log.initialChecked -= totals.checked;
       log.initialNotified -= totals.notified;
@@ -106,9 +168,10 @@
     const notified = (s.notified || 0) - log.initialNotified - unconfirmed.reduce((sum, hour) => sum + hour.notified, 0);
     append(resolved, { at: now, event: 'shift_finished', details: { reason, ...details } });
     logs.pending.push({
-      ...resolved, endedAt, reason, checked, notified, retryAt: 0, downloadId: null
+      ...resolved, events: reportReferences(resolved.events), endedAt, reason, checked, notified, retryAt: 0, downloadId: null
     });
     logs.active = null;
+    if (reason !== 'schedule' || !held?.events.length) delete s.notificationLogIndex;
     return held;
   }
 
@@ -193,6 +256,7 @@
       markDuty(log, calendar, now);
       log.nextOnDuty = onDuty(rosterAt(calendar + HOUR));
     }
+    if (!logs?.active && !logs?.review) delete s.notificationLogIndex;
   }
 
   function missingHour(s, now) {
@@ -246,6 +310,6 @@
   }
 
   globalThis.ShkolkovoShiftLog = Object.freeze({
-    start, record, observe, missingHour, lookupId, confirmHour, finish, nextBoundary, filename, render
+    start, record, diagnostic, identifyChat, parsedTime, observe, missingHour, lookupId, confirmHour, finish, nextBoundary, filename, render
   });
 })();
