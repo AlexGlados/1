@@ -23,19 +23,22 @@
   const compact = (value) => String(value ?? '').replace(/\s+/gu, ' ').trim();
   const textOf = (element) => compact(element.innerText ?? element.textContent);
   const comparable = (value) => compact(value).toLocaleLowerCase('ru').replaceAll('ё', 'е');
-  const offset = 3 * 3_600_000; // Europe/Moscow, all supported chat dates.
   const minuteMs = 60_000;
-  const dayMs = 86_400_000;
   const recentWindow = 20 * minuteMs;
   const isRecent = (at, now = Date.now()) => Number.isFinite(at) && at <= now && now - at < recentWindow;
   const weekdays = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
 
-  function dateAt(year, month, day, hours, minutes, seconds = 0) {
-    const date = new Date(Date.UTC(year, month - 1, day, hours, minutes, seconds));
+  function dateAt(year, month, day, hours, minutes, seconds = 0, millis = 0, zonedLabel = '') {
+    const hour = hours ?? 0;
+    const date = new Date(Date.UTC(year, month - 1, day, hour, minutes, seconds, millis));
     if (year < 2000 || date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 ||
-        date.getUTCDate() !== day || date.getUTCHours() !== hours || date.getUTCMinutes() !== minutes ||
+        date.getUTCDate() !== day || date.getUTCHours() !== hour || date.getUTCMinutes() !== minutes ||
         date.getUTCSeconds() !== seconds) return null;
-    return date.getTime() - offset;
+    if (zonedLabel) return Date.parse(zonedLabel);
+    const local = new Date(year, month - 1, day, hour, minutes, seconds, millis);
+    if (local.getDate() !== day || (hours !== undefined &&
+        (local.getHours() !== hour || local.getMinutes() !== minutes))) return null;
+    return local.getTime();
   }
 
   function parseActivity(value, now = Date.now()) {
@@ -43,31 +46,36 @@
     const absolute = /^(\d{4})-(\d{2})-(\d{2})t(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(z|[+-]\d{2}:\d{2})?$/iu.exec(label);
     if (absolute) {
       const [, y, m, d, h, min, s, fraction, zone] = absolute;
-      const local = dateAt(+y, +m, +d, +h, +min, +(s ?? 0));
-      const at = local === null ? null : zone ? Date.parse(label) : local + Number((fraction ?? '').padEnd(3, '0'));
+      const millis = Number((fraction ?? '').padEnd(3, '0'));
+      const at = dateAt(+y, +m, +d, +h, +min, +(s ?? 0), millis, zone ? label : '');
       return Number.isFinite(at) && at <= now ? { at, precision: s ? 'exact' : 'minute' } : null;
     }
-    const today = new Date(now + offset);
+    const today = new Date(now);
+    const year = today.getFullYear();
+    const month = today.getMonth() + 1;
+    const day = today.getDate();
     const timed = /^(?:(пн|вт|ср|чт|пт|сб|вс|сегодня|вчера)\.?\s*)?(\d{1,2}):(\d{2})(?::(\d{2}))?$/u.exec(label);
     if (timed) {
       const [, prefix, hour, minute, second] = timed;
       const dow = weekdays.indexOf(prefix);
-      const days = dow < 0 ? Number(prefix === 'вчера') : (today.getUTCDay() - dow + 7) % 7;
-      let at = dateAt(today.getUTCFullYear(), today.getUTCMonth() + 1, today.getUTCDate(), +hour, +minute, +(second ?? 0));
-      if (at === null) return null;
-      at -= days * dayMs;
-      if (at > now) {
+      const days = dow < 0 ? Number(prefix === 'вчера') : (today.getDay() - dow + 7) % 7;
+      const fromDay = daysBack => {
+        const date = new Date(Date.UTC(year, month - 1, day - daysBack));
+        return dateAt(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate(), +hour, +minute, +(second ?? 0));
+      };
+      let at = fromDay(days);
+      if (at !== null && at > now) {
         if (prefix === 'сегодня') return null;
-        at -= (dow < 0 ? 1 : 7) * dayMs;
+        at = fromDay(days + (dow < 0 ? 1 : 7));
       }
-      return { at, precision: second ? 'exact' : 'minute' };
+      return at !== null && at <= now ? { at, precision: second ? 'exact' : 'minute' } : null;
     }
     const dated = /^(\d{1,2})\.(\d{1,2})(?:\.(\d{4}|\d{2}))?\.?[,\s]*(?:(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/u.exec(label);
     if (!dated) return null;
-    const [, day, month, year, hour, minute, second] = dated;
-    let y = year ? (+year < 100 ? +year + 2000 : +year) : today.getUTCFullYear();
-    if (!year && (+month > today.getUTCMonth() + 1 || (+month === today.getUTCMonth() + 1 && +day > today.getUTCDate()))) y--;
-    const at = dateAt(y, +month, +day, +(hour ?? 0), +(minute ?? 0), +(second ?? 0));
+    const [, d, m, inputYear, hour, minute, second] = dated;
+    let y = inputYear ? (+inputYear < 100 ? +inputYear + 2000 : +inputYear) : year;
+    if (!inputYear && (+m > month || (+m === month && +d > day))) y--;
+    const at = dateAt(y, +m, +d, hour === undefined ? undefined : +hour, +(minute ?? 0), +(second ?? 0));
     return at !== null && at <= now ? { at, precision: second ? 'exact' : hour ? 'minute' : 'day' } : null;
   }
 
@@ -80,7 +88,7 @@
   function rowStamp(row, label, now) {
     for (const node of row.querySelectorAll('time, [datetime], [title]')) {
       if (!isVisible(node) || textOf(node) !== label) continue;
-      const parsed = parseActivity(node.getAttribute('datetime') || node.getAttribute('title'), now);
+      const parsed = parseActivity(node.getAttribute('datetime'), now) ?? parseActivity(node.getAttribute('title'), now);
       if (parsed) return parsed;
     }
     return parseActivity(label, now);
@@ -459,11 +467,19 @@
 
   function messageStamp(root, label, now = Date.now()) {
     const displayed = parseActivity(label, now);
-    if (!root || displayed?.precision !== 'minute') return displayed;
+    if (!root) return displayed;
     for (const node of [root, ...root.querySelectorAll('time, [datetime], [title]')]) {
       if (textOf(node) !== label || !isVisible(node)) continue;
-      for (const attribute of ['datetime', 'title']) {
-        const stamp = parseActivity(node.getAttribute(attribute), now);
+      const datetime = node.getAttribute('datetime');
+      const machine = parseActivity(datetime, now);
+      if (machine && /(?:z|[+-]\d{2}:\d{2})\s*$/iu.test(datetime)) {
+        // A zoned datetime identifies the instant even during a repeated local hour.
+        if (machine.precision === 'minute' && displayed?.precision === 'exact' &&
+            displayed.at >= machine.at && displayed.at < machine.at + minuteMs) return displayed;
+        return machine;
+      }
+      if (displayed?.precision !== 'minute') continue;
+      for (const stamp of [machine, parseActivity(node.getAttribute('title'), now)]) {
         if (stamp?.precision === 'exact' && stamp.at >= displayed.at && stamp.at < displayed.at + minuteMs) return stamp;
       }
     }
@@ -590,8 +606,9 @@
     let earliest = -Infinity;
     for (const { time, precision } of messages) {
       earliest = Math.max(earliest, time);
-      const uncertainty = precision === 'minute' ? minuteMs - 1 : precision === 'day' ? dayMs - 1 : 0;
-      if (time + uncertainty < earliest) return null;
+      const latest = precision === 'day' ? new Date(time).setHours(24, 0, 0, 0) - 1
+        : time + (precision === 'minute' ? minuteMs - 1 : 0);
+      if (latest < earliest) return null;
     }
     const paging = Array.from(root.querySelectorAll('button, [role="button"]')).filter(element =>
       /^(?:загрузить\s+ещ[её]|(?:показать|загрузить)\s+(?:предыдущие|ранние)\s+сообщения)$/iu.test(textOf(element)));

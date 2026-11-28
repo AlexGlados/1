@@ -12,7 +12,8 @@
     'read_error', 'tab_no_response'
   ]);
   const minute = at => Math.floor(at / MIN) * MIN;
-  const latestPossibleAt = ({ at, precision }) => at + (precision === 'minute' ? MIN - 1 : precision === 'day' ? 24 * HOUR - 1 : 0);
+  const latestPossibleAt = ({ at, precision }) => precision === 'day' ? new Date(at).setHours(24, 0, 0, 0) - 1
+    : at + (precision === 'minute' ? MIN - 1 : 0);
   // Moscow is UTC+3, an integral number of hours. Epoch-hour boundaries coincide.
   const calendarPeriodAt = now => Math.floor(now / HOUR) * HOUR;
   const periodAt = now => calendarPeriodAt(now + 5 * MIN);
@@ -518,8 +519,8 @@
       ...(ambiguous ? { requireSelectedIdentity: true } : {}) };
   }
   function cursor(at, signal, precision, now) {
-    // A date-only list row bounds the old tail somewhere within that Moscow day.
-    const floor = precision === 'day' ? Math.min(now, at + 24 * HOUR - 1) : at;
+    // A date-only list row bounds the old tail somewhere within that local day.
+    const floor = precision === 'day' ? Math.min(now, latestPossibleAt({ at, precision })) : at;
     return { at: floor, keys: null, signal };
   }
   function observeAssignment(c, value, source) {
@@ -846,12 +847,8 @@
     return { kind, phase, id: c.id, title: c.title, at, key, episode: c.waitKey,
       minutes: Math.max(0, Math.floor((now - at) / MIN)), curator: c.binding?.curator };
   }
-  function freeNotice(s, c, now) {
-    if (!isFree(c, now) || c.transferAt != null || c.freeNotifiedEpisode === c.waitKey) return null;
-    c.freeNotifiedEpisode = c.waitKey;
-    const elapsed = Math.floor((now - c.waitSince) / MIN);
-    c.remindedMinute = Math.max(c.remindedMinute || 0, dueMinute(policy(s, c, now), elapsed));
-    return notice(c, 'free', 'now', c.waitSince, c.waitKey, now);
+  function needsInitialFreeNotice(c, now) {
+    return c.transferAt == null && c.freeNotifiedEpisode !== c.waitKey && isFree(c, now);
   }
 
   function apply(s, job, history, now, check) {
@@ -1025,10 +1022,10 @@
     }
     const result = !c.dismissedFree && canNotifyPinned(s, c)
       ? pinMessages.filter(m => recent(m.at, now)).map(m => notice(c, 'pinned', 'now', m.at, m.key, now)) : [];
-    const initial = freeNotice(s, c, now);
-    if (initial) {
+    if (needsInitialFreeNotice(c, now)) {
       // The same confirmation can establish a free chat and a new pinned message.
       // Keep its waiting timestamp and send a single alert for that message.
+      const initial = notice(c, 'free', 'now', c.waitSince, c.waitKey, now);
       const duplicate = result.findIndex(n => n.key === initial.key);
       if (duplicate >= 0) result.splice(duplicate, 1);
       result.push(initial);
@@ -1039,7 +1036,7 @@
 
   function policy(s, c, now) {
     if (c.transferAt != null || c.activityDirty || c.dismissedFree || !c.waitKey || waitingSince(c, now) === null ||
-        !recent(c.lastMessageAt, now)) return null;
+        !recent(c.lastMessageAt, now) || needsInitialFreeNotice(c, now)) return null;
     if (s.mode === 'senior') {
       if (c.binding && !c.muted) return { kind: 'senior', first: 6, every: 2 };
       if (isFree(c, now)) return { kind: 'free', first: 5, every: 2 };
@@ -1111,6 +1108,23 @@
     return c.waitKey === n.episode && policy(s, c, now)?.kind === n.kind &&
       (n.kind !== 'senior' || c.binding?.curator === n.curator);
   }
+  function noticeNeedsRecheck(s, n, now) {
+    if (n.kind !== 'free' || n.phase !== 'now') return false;
+    const c = getChat(s, n.id);
+    return Boolean(c?.activityDirty && c.pending && c.status === 'Свободен' && !c.binding && !c.pinnedColleague &&
+      !c.dismissedFree && c.transferAt == null && c.waitKey === n.episode && waitingSince(c, now) !== null && inWindow(c, now));
+  }
+  function noticeDelivered(s, n, now) {
+    if (n.kind !== 'free' || n.phase !== 'now') return;
+    const c = getChat(s, n.id);
+    if (!c || c.waitKey !== n.episode) return;
+    c.freeNotifiedEpisode = n.episode;
+    const p = policy(s, c, now);
+    if (p) {
+      const elapsed = Math.floor((now - c.waitSince) / MIN);
+      c.remindedMinute = Math.max(c.remindedMinute || 0, dueMinute(p, elapsed));
+    }
+  }
   function setMode(s, mode, now) {
     if (!['normal', 'senior'].includes(mode)) return false;
     s.mode = mode;
@@ -1144,7 +1158,8 @@
   const api = { fresh, start, stop, finish, advance, prepareStartup, periodAt, calendarPeriodAt, calendarSchedule,
     boundary, prefetchTime, scheduleTarget, installRoster, curatorDuty,
     observe, reconcileRows, panelChanged, earliest, next, defer, apply, navigation,
-    setMode, setPinnedInstant, dueNotices, nextNoticeAt, noticeEligible, setChatMute, unbind, isFree, freeVersion, dismissFree,
+    setMode, setPinnedInstant, dueNotices, nextNoticeAt, noticeEligible, noticeNeedsRecheck, noticeDelivered,
+    setChatMute, unbind, isFree, freeVersion, dismissFree,
     waitingSince, isRecentChat: inWindow, isCheckableChat: inCheckWindow, isStartupActivity };
   globalThis.ChatEngine = api;
   if (typeof module !== 'undefined') module.exports = api;

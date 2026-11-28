@@ -100,7 +100,11 @@ function fixture() {
     notifications: {
       onClosed: event(), onClicked: event(),
       getAll: async () => ({ ...notifications }),
-      create: async (id, detail) => { notifications[id] = detail; return id; }
+      create: async (id, detail) => {
+        await controls.beforeNotification?.();
+        notifications[id] = detail;
+        return id;
+      }
     },
     downloads: {
       onChanged: event(),
@@ -148,6 +152,7 @@ function fixture() {
     advance: delta => { now += delta; },
     plan: () => vm.runInContext('plan()', context),
     popup: type => dispatch({ url: ORIGIN + 'popup.html' }, { type }),
+    rows: rows => fromContent('monitor:rows', { rows }),
     report: fields => fromContent('monitor:coverage', fields),
     startupBlock: reason => fromContent('monitor:startup-block', { reason }),
     wake: fields => fromContent('monitor:wake', fields),
@@ -179,6 +184,143 @@ test('the next pass delivers after a task alarm failure', async () => {
   await settle();
   assert.deepEqual(Object.keys(f.notifications), ['notice']);
   assert.equal(f.saved().outbox.notice, undefined);
+});
+
+const FREE_CHAT_ID = 'id:1__2__3';
+const freeRow = (at, signal) => ({
+  id: FREE_CHAT_ID, title: 'Fixture', at, signal, precision: 'exact', unread: true
+});
+const student = (id, at) => ({ id, at, role: 'student', author: 'Fixture' });
+const freeHistory = (id, ...messages) => ({ id, identity: '1__2__3', ready: true, startReached: true, complete: true, messages });
+
+for (const role of ['student', 'staff']) {
+  test('queued free alert waits for a confirmed new ' + role + ' message', async () => {
+    const f = fixture();
+    const first = student('first', START);
+    const recheck = Promise.withResolvers();
+    f.controls.read = ({ id, job }) => job.signal === first.id ? freeHistory(id, first) : recheck.promise;
+
+    await f.rows([freeRow(first.at, first.id)]);
+    await f.plan();
+    await settle();
+    const [queuedId] = Object.keys(f.saved().outbox);
+    assert.ok(queuedId);
+
+    f.advance(1000);
+    const next = { id: 'next', at: START + 1000, role, author: role === 'staff' ? 'Иван Петров' : 'Fixture' };
+    await f.rows([freeRow(next.at, next.id)]);
+    await f.plan();
+    await settle();
+    assert.deepEqual(Object.keys(f.saved().outbox), [queuedId]);
+    assert.deepEqual(Object.keys(f.notifications), []);
+    assert.equal(f.saved().scan.chats[FREE_CHAT_ID].freeNotifiedEpisode, undefined);
+
+    recheck.resolve(freeHistory(FREE_CHAT_ID, first, next));
+    await settle();
+    await f.plan();
+    await settle();
+    assert.deepEqual(Object.keys(f.saved().outbox), []);
+    assert.deepEqual(Object.keys(f.notifications), role === 'student' ? [queuedId] : []);
+    assert.equal(f.saved().scan.chats[FREE_CHAT_ID].freeNotifiedEpisode, role === 'student' ? 'id:first' : undefined);
+  });
+}
+
+test('a second student message after a delivered free alert does not repeat the first alert', async () => {
+  const f = fixture();
+  const first = student('first', START);
+  f.controls.read = ({ id }) => freeHistory(id, first);
+  await f.rows([freeRow(first.at, first.id)]);
+  await f.plan();
+  await settle();
+  await f.plan();
+  await settle();
+  const [deliveredId] = Object.keys(f.notifications);
+  assert.ok(deliveredId);
+
+  f.advance(1000);
+  const next = student('next', START + 1000);
+  f.controls.read = ({ id }) => freeHistory(id, first, next);
+  await f.rows([freeRow(next.at, next.id)]);
+  await f.plan();
+  await settle();
+  await f.plan();
+  await settle();
+  assert.deepEqual(Object.keys(f.notifications), [deliveredId]);
+  assert.equal(f.saved().notified, 1);
+});
+
+test('a pending first free alert keeps the retry and absorbs reminder thresholds on delivery', async () => {
+  const f = fixture();
+  const first = student('first', START - 4.5 * MINUTE);
+  let attempts = 0;
+  f.controls.read = ({ id }) => freeHistory(id, first);
+  f.controls.beforeNotification = () => {
+    if (++attempts === 1) throw new Error('notification failed');
+  };
+  await f.rows([freeRow(first.at, first.id)]);
+  await f.plan();
+  await settle();
+  const [queuedId] = Object.keys(f.saved().outbox);
+  await f.plan();
+  await settle();
+  assert.equal(f.saved().outbox[queuedId].retryAt, START + MINUTE);
+
+  f.advance(45_000);
+  await f.plan();
+  await settle();
+  assert.equal(attempts, 1);
+  assert.deepEqual(Object.keys(f.notifications), []);
+  assert.equal(f.saved().scan.chats[FREE_CHAT_ID].freeNotifiedEpisode, undefined);
+
+  f.advance(15_000);
+  await f.plan();
+  await settle();
+  assert.deepEqual(Object.keys(f.notifications), [queuedId]);
+  assert.equal(attempts, 2);
+  assert.equal(f.saved().scan.chats[FREE_CHAT_ID].remindedMinute, 5);
+});
+
+test('a free alert expires at exactly twenty minutes if it has not been delivered', async () => {
+  const f = fixture();
+  const first = student('first', START - 19.5 * MINUTE);
+  f.controls.read = ({ id }) => freeHistory(id, first);
+  await f.rows([freeRow(first.at, first.id)]);
+  await f.plan();
+  await settle();
+  assert.equal(Object.keys(f.saved().outbox).length, 1);
+
+  f.advance(30_000);
+  await f.plan();
+  await settle();
+  assert.deepEqual(Object.keys(f.saved().outbox), []);
+  assert.deepEqual(Object.keys(f.notifications), []);
+});
+
+test('an accepted free alert is recorded once after its first storage write fails', async () => {
+  const f = fixture();
+  const first = student('first', START);
+  let attempts = 0;
+  f.controls.read = ({ id }) => freeHistory(id, first);
+  f.controls.beforeNotification = () => {
+    if (++attempts === 1) f.controls.failStorage = true;
+  };
+  await f.rows([freeRow(first.at, first.id)]);
+  await f.plan();
+  await settle();
+  const [queuedId] = Object.keys(f.saved().outbox);
+
+  await f.plan();
+  await settle();
+  assert.deepEqual(Object.keys(f.notifications), [queuedId]);
+  assert.ok(f.saved().outbox[queuedId]);
+  assert.equal(f.saved().notified, 0);
+
+  await f.plan();
+  await settle();
+  assert.equal(attempts, 1);
+  assert.equal(f.saved().notified, 1);
+  assert.equal(f.saved().scan.chats[FREE_CHAT_ID].freeNotifiedEpisode, 'id:first');
+  assert.deepEqual(Object.keys(f.saved().outbox), []);
 });
 
 test('the next pass delivers after the planner fails to persist its state', async () => {

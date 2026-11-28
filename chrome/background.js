@@ -295,14 +295,15 @@ async function alarm(name, when) {
     await chrome.alarms.create(name, { when });
   }
 }
-function eligible(s, n) {
-  if (!monitoring(s) || n.tab !== s.tab || n.session !== token(s)) return false;
+function noticeState(s, n, now) {
+  if (!monitoring(s) || n.tab !== s.tab || n.session !== token(s)) return 'obsolete';
   if (n.kind === 'offline' || n.kind === 'connecting') {
     const c = s.connection;
     const sameEpisode = n.kind === c.status || (n.kind === 'offline' && c.status === 'unknown' && c.episode === 'offline');
-    return Boolean(s.doc && n.doc === s.doc && sameEpisode && n.since === c.since);
+    return s.doc && n.doc === s.doc && sameEpisode && n.since === c.since ? 'ready' : 'obsolete';
   }
-  return E.noticeEligible(s.scan, n, Date.now());
+  if (E.noticeEligible(s.scan, n, now)) return 'ready';
+  return E.noticeNeedsRecheck(s.scan, n, now) ? 'recheck' : 'obsolete';
 }
 
 function addRows(s, result, startupCutoff = s.scan.startupCutoff) {
@@ -647,10 +648,9 @@ async function plan() {
     const noticeAt = E.nextNoticeAt(s.scan, now);
     if (noticeAt > now) times.push(noticeAt);
     for (const [id, item] of Object.entries(s.outbox)) {
-      if (!eligible(s, item)) {
-        removeNotice(s, id);
-        continue;
-      }
+      const state = noticeState(s, item, now);
+      if (state === 'obsolete') removeNotice(s, id);
+      if (state !== 'ready') continue;
       if (item.retryAt > now) { times.push(item.retryAt); continue; }
       if (!runningDelivery) {
         runningDelivery = id;
@@ -934,10 +934,9 @@ async function deliver(id) {
         // Recheck the episode immediately before submitting, including after a delayed alarm.
         const now = Date.now();
         E.advance(s.scan, now);
-        if (!eligible(s, n)) {
-          removeNotice(s, id);
-          return;
-        }
+        const state = noticeState(s, n, now);
+        if (state === 'obsolete') removeNotice(s, id);
+        if (state !== 'ready') return;
         if (!Object.hasOwn(existing, id)) {
           if (n.kind === 'offline') {
             const tab = await chrome.tabs.get(n.tab).catch(() => null);
@@ -960,9 +959,11 @@ async function deliver(id) {
           const [title, message] = noticeCopy(latest);
           await chrome.notifications.create(id, notification(title, message));
         }
+        const deliveredAt = Date.now();
+        E.noticeDelivered(s.scan, n, deliveredAt);
         s.routes[id] = { tab: n.tab, id: n.id || null, kind: n.kind, boot: bootId };
         if (n.kind !== 'offline' && n.kind !== 'connecting') s.notified = (s.notified || 0) + 1;
-        shiftLog.record(s, now, 'notification_delivered', { kind: n.kind, phase: n.phase });
+        shiftLog.record(s, deliveredAt, 'notification_delivered', { kind: n.kind, phase: n.phase });
         removeNotice(s, id);
       } catch {
         n.retryAt = Date.now() + MIN;

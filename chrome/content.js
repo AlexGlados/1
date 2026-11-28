@@ -7,10 +7,10 @@
   const runtimeId = runtime.id;
   const dom = globalThis.ShkolkovoDom;
   const minute = 60_000;
-  const day = 24 * 60 * minute;
   const retryGapDelay = 7_000;
   const headRetryDelay = 5_000;
-  const latestPossibleAt = row => row.at + (row.precision === 'day' ? day - 1 : row.precision === 'minute' ? minute - 1 : 0);
+  const latestPossibleAt = ({ at, precision }) => precision === 'day' ? new Date(at).setHours(24, 0, 0, 0) - 1
+    : at + (precision === 'minute' ? minute - 1 : 0);
   const validPage = () => /^\/chat\/?$/u.test(location.pathname);
   const pageListeners = new AbortController();
   let detached = false;
@@ -935,7 +935,7 @@
     const last = chat.messages.at(-1);
     if (row.signal && last.id && row.signal !== last.id) return false;
     if (row.precision === 'day') {
-      return Math.floor((last.time + 10_800_000) / 86_400_000) === Math.floor((row.at + 10_800_000) / 86_400_000);
+      return last.time >= row.at && last.time <= latestPossibleAt(row);
     }
     return Math.floor(last.time / minute) === Math.floor(row.at / minute);
   }
