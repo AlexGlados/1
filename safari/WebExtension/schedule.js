@@ -118,11 +118,7 @@
     if (!/^\d+$/.test(row[3]) || Number(row[3]) !== filled) {
       throw scheduleError('schedule_roster', 'Число назначений расходится с итогом в строке');
     }
-    for (const name of [row[2], row[4]]) {
-      if (name && !assignments.has(nameKey(name))) {
-        throw scheduleError('schedule_roster', 'Назначение в столбце роли расходится с персональными столбцами');
-      }
-    }
+    
     return {names: [...assignments.values()], directory: [...directory.values()]};
   }
 
