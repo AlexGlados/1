@@ -78,20 +78,24 @@
     return rows;
   }
 
-  function nameKey(name) {
-    return name.toLowerCase().replaceAll('ё', 'е').trim().split(/\s+/).sort().join(' ');
-  }
-
-  const fullName = /^[\p{L}]+(?:[-’'][\p{L}]+)*(?:\s+[\p{L}]+(?:[-’'][\p{L}]+)*){1,2}$/u;
+  const { clean, key: nameKey } = globalThis.ShkolkovoIdentity;
+  const fullName = /^\p{L}[\p{L}\p{M}]*(?:[-']\p{L}[\p{L}\p{M}]*)*(?: \p{L}[\p{L}\p{M}]*(?:[-']\p{L}[\p{L}\p{M}]*)*){1,2}$/u;
+  const requiredColumns = ['день', 'час', 'итого'];
+  const nonPersonalColumns = new Set([...requiredColumns, 'старший', 'веб', '']);
   function hourAssignments(csv, requestedDay, hour) {
     const [header, ...rows] = csvRows(csv);
-    if (header?.[0]?.toLowerCase() !== 'день' || header[2]?.toLowerCase() !== 'старший' || header[4]?.toLowerCase() !== 'веб') {
+    const headings = (header ?? []).map(value => clean(value).toLocaleLowerCase('ru'));
+    const [dayColumn, hourColumn, totalColumn] = requiredColumns.map(name => {
+      const index = headings.indexOf(name);
+      return index === headings.lastIndexOf(name) ? index : -1;
+    });
+    if ([dayColumn, hourColumn, totalColumn].includes(-1)) {
       throw scheduleError('schedule_roster', 'Не распознаны столбцы недельного листа');
     }
     const weekday = weekdays[new Date(requestedDay).getUTCDay()];
     const selected = rows.filter(row => {
-      const time = /^(\d{1,2}):00(?::00)?$/.exec(row[1]);
-      return row[0].toLowerCase() === weekday && time && Number(time[1]) === hour;
+      const time = /^(\d{1,2}):00(?::00)?$/.exec(row[hourColumn]);
+      return row[dayColumn]?.toLowerCase() === weekday && time && Number(time[1]) === hour;
     });
     if (!selected.length) throw scheduleError('schedule_hour_missing', 'В недельном листе нет строки на нужный час');
     if (selected.length !== 1) throw scheduleError('schedule_hour_ambiguous', 'В недельном листе несколько строк на один час');
@@ -99,29 +103,25 @@
     if (row.length !== header.length) throw scheduleError('schedule_roster', 'Неполная строка расписания');
     const assignments = new Map();
     const directory = new Map();
-    let filled = 0;
-    for (let i = 5; i < row.length; i++) {
-      if (header[i]) {
-        if (!fullName.test(header[i])) {
-          throw scheduleError('schedule_roster', 'Не распознано имя в заголовке персонального столбца');
-        }
-        directory.set(nameKey(header[i]), header[i]);
+    for (let i = 0; i < row.length; i++) {
+      if (nonPersonalColumns.has(headings[i])) continue;
+      if (!fullName.test(clean(header[i]))) {
+        throw scheduleError('schedule_roster', 'Не распознано имя в заголовке персонального столбца');
       }
+      const headerKey = nameKey(header[i]);
+      if (directory.has(headerKey)) {
+        throw scheduleError('schedule_duplicate_curator', 'В расписании совпадают имена в заголовках персональных столбцов');
+      }
+      directory.set(headerKey, header[i]);
       if (!row[i]) continue;
       const key = nameKey(row[i]);
-      if (!fullName.test(row[i]) || key !== nameKey(header[i])) {
+      if (!fullName.test(clean(row[i])) || key !== headerKey) {
         throw scheduleError('schedule_roster', 'В персональном столбце не распознано назначение');
       }
       assignments.set(key, header[i]);
-      filled++;
     }
-    if (!/^\d+$/.test(row[3]) || Number(row[3]) !== filled) {
+    if (!/^\d+$/.test(row[totalColumn]) || Number(row[totalColumn]) !== assignments.size) {
       throw scheduleError('schedule_roster', 'Число назначений расходится с итогом в строке');
-    }
-    for (const name of [row[2], row[4]]) {
-      if (name && !assignments.has(nameKey(name))) {
-        throw scheduleError('schedule_roster', 'Назначение в столбце роли расходится с персональными столбцами');
-      }
     }
     return {names: [...assignments.values()], directory: [...directory.values()]};
   }

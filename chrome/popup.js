@@ -123,9 +123,10 @@ function draw(s) {
   message('mode-status', !senior ? '' : s.active ? 'Режим старшего включён.'
     : 'Режим старшего выбран. Запусти мониторинг, чтобы начать проверку чатов.');
   el('pinned-instant').checked = s?.pinnedInstant !== false;
-  const conn = s?.active ? s.connection : 'unknown';
+  const browserOffline = s?.active && navigator.onLine === false;
+  const conn = browserOffline ? 'offline' : s?.active ? s.connection : 'unknown';
   el('connection').dataset.state = conn;
-  el('connection').textContent = connectionLabels[conn] || connectionLabels.unknown;
+  el('connection').textContent = browserOffline ? 'Браузер не в сети' : connectionLabels[conn] || connectionLabels.unknown;
   const range = Number.isFinite(s?.scheduleHour) ? clock.scheduleRange(s.scheduleHour) : null;
   el('period').textContent = range?.moscow || '—';
   message('period-local', range?.local || '');
@@ -190,6 +191,9 @@ el('senior').addEventListener('change', event => command('ui:settings', {
 el('pinned-instant').addEventListener('change', event => command('ui:settings', {
   pinnedInstant: event.currentTarget.checked
 }));
+for (const event of ['online', 'offline']) {
+  window.addEventListener(event, () => { draw(state); void refresh(); });
+}
 async function initialize() {
   if (!hasExtension) { draw(null); return; }
   try {

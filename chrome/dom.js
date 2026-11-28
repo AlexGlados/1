@@ -118,9 +118,11 @@
         const explicit = source === 'datetime' && stamp.zone;
         const sameMinute = usableTime(displayed, now) && stamp.at >= displayed.at && stamp.at < displayed.at + minuteMs;
         if (usableTime(stamp, now)) {
-          if (history && explicit && stamp.precision === 'minute' && displayed?.precision === 'exact' &&
+          if (history && source === 'datetime' && stamp.precision === 'minute' && displayed?.precision === 'exact' &&
               displayed.at >= stamp.at && displayed.at < stamp.at + minuteMs) {
-            return stampWithSource(displayed, 'text', rejected, now);
+            if (usableTime(displayed, now)) return stampWithSource(displayed, 'text', rejected, now);
+            rejected.push({ source: 'text', reason: 'future_timestamp', deltaMs: displayed.at - stamp.at });
+            return stampWithSource(stamp, source, rejected, now);
           }
           if (!history || explicit || (displayed?.precision === 'minute' && stamp.precision === 'exact' && sameMinute)) {
             return stampWithSource(stamp, source, rejected, now);

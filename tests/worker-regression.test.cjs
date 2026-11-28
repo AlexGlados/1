@@ -152,6 +152,11 @@ function fixture() {
     advance: delta => { now += delta; },
     plan: () => vm.runInContext('plan()', context),
     popup: type => dispatch({ url: ORIGIN + 'popup.html' }, { type }),
+    diagnostic(chatId, label) {
+      return vm.runInContext(
+        'tx(s => shiftLog.diagnostic(s, Date.now(), "chat_check_failed", { chatId: ' + JSON.stringify(chatId) +
+        ' }, { reason: ' + JSON.stringify(label) + ' }))', context);
+    },
     rows: rows => fromContent('monitor:rows', { rows }),
     report: fields => fromContent('monitor:coverage', fields),
     startupBlock: reason => fromContent('monitor:startup-block', { reason }),
@@ -193,6 +198,27 @@ const freeRow = (at, signal) => ({
 const student = (id, at) => ({ id, at, role: 'student', author: 'Fixture' });
 const freeHistory = (id, ...messages) => ({ id, identity: '1__2__3', ready: true, startReached: true, complete: true, messages });
 const logged = (f, event) => f.saved().shiftLogs.active.events.filter(entry => entry.event === event).map(entry => entry.details);
+
+test('confirmation in the list and history merges late temporary references into the same chat', async () => {
+  const f = fixture();
+  const temporary = '2:fixture';
+  const first = student('first', START);
+  await f.diagnostic(FREE_CHAT_ID, 'canonical');
+  await f.diagnostic(temporary, 'temporary_before_list');
+  const [native, previous] = logged(f, 'chat_check_failed');
+  assert.notEqual(native.chat_ref, previous.chat_ref);
+
+  f.controls.read = ({ id }) => freeHistory(id, first);
+  await f.rows([{ ...freeRow(first.at, first.id), id: temporary, identity: '1__2__3' }]);
+  assert.equal(logged(f, 'chat_check_failed')[1].chat_ref, native.chat_ref);
+
+  await f.diagnostic(temporary, 'temporary_before_history');
+  assert.notEqual(logged(f, 'chat_check_failed')[2].chat_ref, native.chat_ref);
+  await f.plan();
+  await settle();
+  assert.equal(logged(f, 'chat_check_failed')[2].chat_ref, native.chat_ref);
+  assert.equal(logged(f, 'chat_checked')[0].chat_ref, native.chat_ref);
+});
 
 for (const role of ['student', 'staff']) {
   test('queued free alert waits for a confirmed new ' + role + ' message', async () => {
@@ -340,33 +366,71 @@ test('a free alert expires at exactly twenty minutes if it has not been delivere
   assert.equal(cancelled.notification_ref, logged(f, 'notification_decision')[0].notification_ref);
 });
 
-test('a queued reminder removed after new activity records the cancellation cause', async () => {
-  const f = fixture();
-  const first = student('first', START);
-  f.controls.read = ({ id }) => freeHistory(id, first);
-  await f.rows([freeRow(first.at, first.id)]);
-  await f.plan();
-  await settle();
-  await f.plan();
-  await settle();
+for (const role of ['student', 'staff']) {
+  test('a failed final reminder waits for a confirmed ' + role + ' message before retrying', async () => {
+    const f = fixture();
+    const first = student('first', START);
+    f.controls.read = ({ id }) => freeHistory(id, first);
+    await f.rows([freeRow(first.at, first.id)]);
+    await f.plan();
+    await settle();
+    await f.plan();
+    await settle();
+    const [firstNotice] = Object.keys(f.notifications);
+    assert.ok(firstNotice);
 
-  f.advance(5 * MINUTE);
-  f.controls.beforeNotification = () => { throw new Error('notification failed'); };
-  await f.plan();
-  await settle();
-  const reminder = logged(f, 'notification_decision').find(entry => entry.phase === 'reminder');
-  assert.ok(reminder);
+    let attempts = 0;
+    f.advance(10 * MINUTE);
+    f.controls.beforeNotification = () => {
+      if (++attempts === 1) throw new Error('notification failed');
+    };
+    await f.plan();
+    await settle();
+    const [noticeId] = Object.keys(f.saved().outbox);
+    const reminder = logged(f, 'notification_decision').find(entry => entry.phase === 'reminder');
+    assert.ok(reminder);
+    assert.equal(f.saved().outbox[noticeId].reminderMinute, 10);
+    assert.equal(f.saved().scan.chats[FREE_CHAT_ID].remindedMinute || 0, 0);
+    assert.equal(f.saved().outbox[noticeId].retryAt, START + 11 * MINUTE);
 
-  f.advance(1000);
-  const next = student('next', START + 5 * MINUTE + 1000);
-  f.controls.read = ({ id }) => freeHistory(id, first, next);
-  await f.rows([freeRow(next.at, next.id)]);
-  await f.plan();
-  await settle();
-  const [cancelled] = logged(f, 'notification_cancelled');
-  assert.equal(cancelled.reason, 'new_activity_before_send');
-  assert.equal(cancelled.notification_ref, reminder.notification_ref);
-});
+    const recheck = Promise.withResolvers();
+    f.advance(1000);
+    const next = { ...student('next', START + 10 * MINUTE + 1000), role,
+      author: role === 'staff' ? 'Иван Петров' : 'Fixture' };
+    f.controls.read = () => recheck.promise;
+    await f.rows([freeRow(next.at, next.id)]);
+    await f.plan();
+    await settle();
+    f.advance(MINUTE - 1000);
+    await f.plan();
+    await settle();
+    assert.deepEqual(Object.keys(f.saved().outbox), [noticeId]);
+    assert.equal(attempts, 1);
+    const [deferred] = logged(f, 'notification_deferred');
+    assert.equal(deferred.reason, 'new_activity_before_send');
+    assert.equal(deferred.notification_ref, reminder.notification_ref);
+
+    recheck.resolve(freeHistory(FREE_CHAT_ID, first, next));
+    await settle();
+    await f.plan();
+    await settle();
+    assert.deepEqual(Object.keys(f.saved().outbox), []);
+    assert.deepEqual(Object.keys(f.notifications), role === 'student' ? [firstNotice, noticeId] : [firstNotice]);
+    const results = logged(f, 'notification_api_result').filter(entry => entry.notification_ref === reminder.notification_ref);
+    assert.deepEqual(results.map(entry => entry.result), role === 'student' ? ['rejected', 'accepted'] : ['rejected']);
+    assert.equal(f.saved().scan.chats[FREE_CHAT_ID].remindedMinute, role === 'student' ? 10 : 0);
+    if (role === 'staff') {
+      const [cancelled] = logged(f, 'notification_cancelled');
+      assert.equal(cancelled.reason, 'curator_replied');
+      assert.equal(cancelled.notification_ref, reminder.notification_ref);
+    }
+
+    f.advance(MINUTE);
+    await f.plan();
+    await settle();
+    assert.equal(attempts, role === 'student' ? 2 : 1);
+  });
+}
 
 test('an accepted free alert is recorded once after its first storage write fails', async () => {
   const f = fixture();

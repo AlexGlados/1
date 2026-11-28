@@ -255,6 +255,7 @@ function addNotice(s, item, now = Date.now()) {
   s.outbox[id] = { ...item, tab: s.tab, session: token(s), retryAt: 0 };
   const reason = item.phase === 'reminder' ? 'reminder_due' : queuedReasons[item.kind];
   noticeTrace(s, now, 'notification_decision', id, item, { decision: 'queued', reason, ...times });
+  return id;
 }
 function removeNotice(s, id, reason, now = Date.now()) {
   if (reason && s.outbox[id]) noticeTrace(s, now, 'notification_cancelled', id, s.outbox[id], { reason });
@@ -337,7 +338,7 @@ function noticeBlock(s, n, now) {
     return sameEpisode && n.since === c.since ? '' : 'connection_changed';
   }
   const reason = E.noticeIneligibleReason(s.scan, n, now);
-  return reason && E.noticeNeedsRecheck(s.scan, n, now) ? 'recheck' : reason;
+  return reason === 'new_activity_before_send' && E.noticeNeedsRecheck(s.scan, n, now) ? 'recheck' : reason;
 }
 function noticeReady(s, id, item, now) {
   const reason = noticeBlock(s, item, now);
@@ -357,6 +358,13 @@ function addRows(s, result, startupCutoff = s.scan.startupCutoff) {
   const startup = Number.isFinite(startupCutoff);
   if (!Number.isFinite(result.observedAt) || !E.observe(s.scan, result.rows, Date.now(), result.observedAt,
     { partial: true, ...(startup ? { startupCutoff } : {}) })) return false;
+  if (s.notificationLogIndex) {
+    for (const row of result.rows) {
+      if (typeof row?.id !== 'string' || !/^\d+__\d+__\d+$/u.test(row.identity ?? '')) continue;
+      const chat = trackedChat(s, 'id:' + row.identity);
+      if (chat?.rowKey === row.id) shiftLog.identifyChat(s, row.id, chat.id);
+    }
+  }
   if (!startup) rememberHead(s.scan, result);
   return true;
 }
@@ -691,11 +699,23 @@ async function plan() {
       actions.push(() => readSchedule(generation, target));
     }
     for (const retry of [calendar.retryAt, s.scan.scheduleRetryAt, s.scan.prefetchRetryAt]) if (retry > now) times.push(retry);
-    for (const item of E.dueNotices(s.scan, now)) addNotice(s, item, now);
-    const noticeAt = E.nextNoticeAt(s.scan, now);
-    if (noticeAt > now) times.push(noticeAt);
+    const readyNotices = [];
+    const pendingReminders = new Set();
     for (const [id, item] of Object.entries(s.outbox)) {
-      if (!noticeReady(s, id, item, now)) continue;
+      if (noticeReady(s, id, item, now)) readyNotices.push(id);
+      if (item.phase === 'reminder' && item.id && Object.hasOwn(s.outbox, id)) pendingReminders.add(item.id);
+    }
+    for (const item of E.dueNotices(s.scan, now, pendingReminders)) {
+      const id = addNotice(s, item, now);
+      if (!id) continue;
+      readyNotices.push(id);
+      if (item.phase === 'reminder' && item.id) pendingReminders.add(item.id);
+    }
+    const noticeAt = E.nextNoticeAt(s.scan, now, pendingReminders);
+    if (noticeAt > now) times.push(noticeAt);
+    for (const id of readyNotices) {
+      const item = s.outbox[id];
+      if (!item) continue;
       if (item.retryAt > now) { times.push(item.retryAt); continue; }
       if (!runningDelivery) {
         runningDelivery = id;
@@ -906,6 +926,7 @@ async function readChat(ref, job) {
           }
           notices = E.apply(s.scan, job, history, now, check);
           shiftLog.identifyChat(s, job.id, check.chatId);
+          if (check.verifiedRowKey) shiftLog.identifyChat(s, check.verifiedRowKey, check.chatId);
         }
         const keys = { chatId: check.chatId, episode: check.episode };
         shiftLog.parsedTime(s, now, keys, 'list', history.timeDiagnostics?.list);
@@ -966,7 +987,7 @@ function waitLabel(minutes) {
 }
 function noticeCopy(n) {
   switch (n.kind) {
-    case 'offline': return ['Школково не в сети', 'У раздела «Чаты» появился статус offline.'];
+    case 'offline': return ['Школково не в сети', 'Подключение к чатам прервано.'];
     case 'connecting': return ['Платформа Школково зависла', 'Индикатор показывает connecting уже 30 секунд.'];
     case 'handover': return ['Передача чатов Школково', 'Чатов в ожидании нового куратора — ' + n.count + '.'];
     case 'senior': return ['Ученик ждёт ответа', 'Чат «' + safeLabel(n.title) + '» куратора ' + safeLabel(n.curator) +

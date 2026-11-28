@@ -22,5 +22,5 @@
     return Boolean(first && first === key(right));
   }
 
-  globalThis.ShkolkovoIdentity = { parse, key, matches };
+  globalThis.ShkolkovoIdentity = { clean, parse, key, matches };
 })();

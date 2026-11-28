@@ -141,3 +141,85 @@ test('references follow buffered events within a report and rotate at a shift bo
   const exportText = log.render(first, '1.11.7') + log.render(second, '1.11.7');
   assert.doesNotMatch(exportText, /123__456__789|private-episode-id|chrome-internal-notice|Иван Петров/u);
 });
+
+test('repeated timestamp diagnostics coalesce and ordinary overflow preserves connection and delivery', () => {
+  const { s, log } = fixture();
+  const keys = { chatId: 'id:123__456__789', episode: 'private-episode-id', noticeId: 'native-reference', kind: 'free' };
+  const time = { source: 'datetime', precision: 'exact', timezone: 'explicit', offsetMinutes: 120, at: stamp(0, 1) };
+  log.record(s, stamp(0, 2), 'connection_changed', { status: 'offline' });
+  log.diagnostic(s, stamp(0, 3), 'notification_api_result', keys, { kind: 'free', result: 'accepted' });
+  for (let i = 0; i < 1300; i++) {
+    log.parsedTime(s, stamp(0, 4) + i, keys, 'history', time);
+    log.diagnostic(s, stamp(0, 4) + i, 'chat_check_failed', keys, { reason: 'row_unavailable' });
+  }
+  for (let i = 0; i < 1300; i++) log.parsedTime(s, stamp(0, 5) + i, keys, 'history', time);
+  log.finish(s, stamp(0, 7), 'manual');
+  const report = s.shiftLogs.pending[0];
+  assert.equal(report.events.length, 1200);
+  assert.ok(report.omitted > 0);
+  assert.ok(report.events.some(entry => entry.event === 'connection_changed' && entry.details.status === 'offline'));
+  assert.ok(report.events.some(entry => entry.event === 'notification_api_result' && entry.details.result === 'accepted'));
+  const [entry] = report.events.filter(entry => entry.event === 'message_time_parsed');
+  assert.ok(entry.occurrences >= 1300);
+  assert.equal(entry.lastAt, stamp(0, 5) + 1299);
+  assert.match(log.render(report, '1.11.7'), new RegExp('"occurrences":' + entry.occurrences));
+});
+
+test('buffered hours preserve connection and delivery through unrelated events and export', () => {
+  const { s, log, setRoster, check } = fixture();
+  const next = stamp(1, 1);
+  log.record(s, next, 'connection_changed', { status: 'offline' });
+  log.record(s, next + 1, 'notification_api_result', { kind: 'free', result: 'rejected' });
+  for (let i = 0; i < 1300; i++) check(next + 2 + i);
+  log.record(s, next + 1302, 'connection_changed', { status: 'online' });
+  setRoster(hour(1), [CURATOR]);
+  log.observe(s, stamp(1, 3), true);
+  log.finish(s, stamp(1, 4), 'manual');
+  const report = s.shiftLogs.pending[0];
+  assert.equal(report.checked, 1300);
+  assert.ok(report.omitted > 0);
+  assert.deepEqual(Array.from(report.events.filter(entry => entry.event === 'connection_changed'), entry => entry.details.status),
+    ['offline', 'online']);
+  assert.ok(report.events.some(entry => entry.event === 'notification_api_result' && entry.details.result === 'rejected'));
+});
+
+test('delivery traffic cannot evict the connection transitions from a saturated journal', () => {
+  const { s, log } = fixture();
+  const at = stamp(0, 2);
+  for (let i = 0; i < 1200; i++) log.record(s, at + i, 'notification_api_result', { result: 'accepted' });
+  log.record(s, at + 1200, 'connection_changed', { status: 'offline' });
+  log.record(s, at + 3300, 'connection_changed', { status: 'online' });
+  for (let i = 0; i < 1200; i++) log.record(s, at + 3301 + i, 'notification_api_result', { result: 'rejected' });
+  log.finish(s, stamp(0, 3), 'manual');
+  const report = s.shiftLogs.pending[0];
+  assert.equal(report.events.length, 1200);
+  assert.deepEqual(Array.from(report.events.filter(entry => entry.event === 'connection_changed'), entry => entry.details.status),
+    ['offline', 'online']);
+  assert.ok(report.events.some(entry => entry.event === 'notification_api_result' && entry.details.result === 'rejected'));
+});
+
+test('confirming a temporary chat key merges active and buffered chat and episode references', () => {
+  const { s, log, setRoster } = fixture();
+  const canonical = { chatId: 'id:123__456__789', episode: 'private-episode-id', noticeId: 'private-notice' };
+  const temporary = { ...canonical, chatId: '5:temporary-key' };
+  log.diagnostic(s, stamp(0, 2), 'notification_decision', canonical, { decision: 'queued' });
+  log.diagnostic(s, stamp(0, 3), 'notification_deferred', temporary, { reason: 'new_activity_before_send' });
+  log.diagnostic(s, stamp(1, 2), 'notification_api_result', temporary, { result: 'rejected' });
+  const queued = s.shiftLogs.active.events.find(entry => entry.event === 'notification_decision');
+  assert.notEqual(queued.details.chat_ref, s.shiftLogs.active.held.events[0].details.chat_ref);
+
+  s.notificationLogIndex = JSON.parse(JSON.stringify(s.notificationLogIndex));
+  s.shiftLogs = JSON.parse(JSON.stringify(s.shiftLogs));
+  log.identifyChat(s, temporary.chatId, canonical.chatId);
+  log.diagnostic(s, stamp(1, 3), 'notification_api_result', canonical, { result: 'accepted' });
+  setRoster(hour(1), [CURATOR]);
+  log.observe(s, stamp(1, 4), true);
+  log.finish(s, stamp(1, 5), 'manual');
+  const report = s.shiftLogs.pending[0];
+  const events = report.events.filter(entry => entry.event.startsWith('notification_'));
+  assert.equal(events.length, 4);
+  for (const field of ['chat_ref', 'episode_ref', 'notification_ref']) {
+    assert.equal(new Set(events.map(entry => entry.details[field])).size, 1);
+  }
+  assert.doesNotMatch(log.render(report, '1.11.7'), /123__456__789|temporary-key|private-episode-id|private-notice/u);
+});

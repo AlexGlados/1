@@ -8,9 +8,11 @@
 body {
   box-sizing: border-box;
   width: 344px;
+  max-width: 100%;
   margin: 0;
   font-size: 13px;
   line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .log-settings {
@@ -130,7 +132,7 @@ summary { cursor: pointer; font-weight: 600; }
 
 dl {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px 12px;
   margin: 0 0 12px;
   padding: 8px 10px;
@@ -202,4 +204,12 @@ button:focus-visible, summary:focus-visible, input:focus-visible {
 
 [hidden] {
   display: none !important;
+}
+
+@media (max-width: 320px) {
+  main { padding: 12px; }
+}
+
+@media (max-width: 240px) {
+  dl { grid-template-columns: minmax(0, 1fr); }
 }

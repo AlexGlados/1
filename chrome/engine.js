@@ -939,7 +939,10 @@
     if (h.identity) {
       c = identify(s, c, h.identity);
       if (c.identity == null) c.identity = h.identity;
-      if (check) check.chatId = c.id;
+      if (check) {
+        check.chatId = c.id;
+        if (c.id === 'id:' + h.identity) check.verifiedRowKey = job.rowKey;
+      }
       if (!c.pending) return skip('job_stale');
     }
     const participant = list.findLast(message => message.role === 'student' || isReply(message));
@@ -1101,16 +1104,17 @@
     if (!h.noticed) return now;
     return h.repeatedAt == null ? h.period : h.repeatedAt + 2 * MIN;
   }
-  function nextNoticeAt(s, now) {
+  function nextNoticeAt(s, now, pendingReminders) {
     if (!s.enabled) return Infinity;
     let at = transferDue(s, now);
     for (const c of Object.values(s.chats)) {
+      if (pendingReminders?.has(c.id)) continue;
       const p = policy(s, c, now);
       if (p) at = Math.min(at, c.waitSince + nextMinute(p, c.remindedMinute || 0) * MIN);
     }
     return at;
   }
-  function dueNotices(s, now) {
+  function dueNotices(s, now, pendingReminders) {
     if (!s.enabled) return [];
     advance(s, now);
     const out = [];
@@ -1124,13 +1128,13 @@
         key: ['handover', h.period, h.repeatedAt ?? phase].join(':') });
     }
     for (const c of Object.values(s.chats)) {
+      if (pendingReminders?.has(c.id)) continue;
       const p = policy(s, c, now);
       if (!p) continue;
       const elapsed = Math.floor((now - c.waitSince) / MIN);
       const due = dueMinute(p, elapsed);
       if (due <= (c.remindedMinute || 0)) continue;
-      c.remindedMinute = due;
-      out.push(notice(c, p.kind, 'reminder', c.waitSince, c.waitKey + ':' + due, now));
+      out.push({ ...notice(c, p.kind, 'reminder', c.waitSince, c.waitKey + ':' + due, now), reminderMinute: due });
     }
     return out;
   }
@@ -1144,21 +1148,22 @@
     const c = getChat(s, n.id);
     if (!c) return 'chat_unavailable';
     if (c.dismissedFree) return 'chat_dismissed';
-    if (!recent(c.lastMessageAt, now)) return 'last_message_too_old';
+    const recheckingFreshRow = n.phase === 'reminder' && c.activityDirty && c.pending && recent(c.at, now);
+    if (!recent(c.lastMessageAt, now) && !recheckingFreshRow) return 'last_message_too_old';
     if (n.phase === 'now' && n.kind === 'pinned') {
       if (!canNotifyPinned(s, c)) return pinnedNoticeBlock(s, c);
       return recent(n.at, now) ? '' : 'pinned_message_too_old';
     }
-    if (c.activityDirty) return 'new_activity_before_send';
     if (c.waitKey !== n.episode) {
       return Number.isFinite(c.lastReplyAt) && c.lastReplyAt >= n.at ? 'curator_replied' : 'episode_changed';
     }
+    if (n.kind === 'senior' && c.muted) return 'chat_muted';
+    if (c.activityDirty) return 'new_activity_before_send';
     if (n.phase === 'now' && n.kind === 'free') {
       if (c.transferAt != null) return 'handover_summary';
       if (waitingSince(c, now) === null) return 'wait_expired';
       return isFree(c, now) ? '' : 'chat_not_free';
     }
-    if (n.kind === 'senior' && c.muted) return 'chat_muted';
     if (policy(s, c, now)?.kind !== n.kind) return 'reminder_policy_changed';
     return n.kind === 'senior' && c.binding?.curator !== n.curator ? 'curator_changed' : '';
   }
@@ -1166,21 +1171,22 @@
     return noticeIneligibleReason(s, n, now) === '';
   }
   function noticeNeedsRecheck(s, n, now) {
-    if (n.kind !== 'free' || n.phase !== 'now') return false;
     const c = getChat(s, n.id);
-    return Boolean(c?.activityDirty && c.pending && c.status === 'Свободен' && !c.binding && !c.pinnedColleague &&
-      !c.dismissedFree && c.transferAt == null && c.waitKey === n.episode && waitingSince(c, now) !== null && inWindow(c, now));
+    if (!c?.activityDirty || !c.pending || c.dismissedFree || c.transferAt != null ||
+        c.waitKey !== n.episode || waitingSince(c, now) === null || !inWindow(c, now)) return false;
+    if (n.phase === 'reminder') return true;
+    return n.kind === 'free' && n.phase === 'now' && c.status === 'Свободен' && !c.binding && !c.pinnedColleague;
   }
   function noticeDelivered(s, n, now) {
-    if (n.kind !== 'free' || n.phase !== 'now') return;
+    if (!n.id) return;
     const c = getChat(s, n.id);
     if (!c || c.waitKey !== n.episode) return;
-    c.freeNotifiedEpisode = n.episode;
+    const initialFree = n.kind === 'free' && n.phase === 'now';
+    if (!initialFree && n.phase !== 'reminder') return;
+    if (initialFree) c.freeNotifiedEpisode = n.episode;
     const p = policy(s, c, now);
-    if (p) {
-      const elapsed = Math.floor((now - c.waitSince) / MIN);
-      c.remindedMinute = Math.max(c.remindedMinute || 0, dueMinute(p, elapsed));
-    }
+    const elapsed = Math.floor((now - c.waitSince) / MIN);
+    c.remindedMinute = Math.max(c.remindedMinute || 0, n.reminderMinute || 0, dueMinute(p, elapsed));
   }
   function setMode(s, mode, now) {
     if (!['normal', 'senior'].includes(mode)) return false;

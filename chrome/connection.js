@@ -71,7 +71,7 @@
         });
       }
 
-      const next = badge?.status ?? null;
+      const next = navigator.onLine === false ? 'offline' : badge?.status ?? null;
       const now = Date.now();
       const previousVisible = visibleStatus;
       visibleStatus = next;
@@ -113,11 +113,15 @@
     function start() {
       if (active) return;
       active = true;
+      window.addEventListener('offline', refresh);
+      window.addEventListener('online', refresh);
       refresh();
     }
 
     function stop() {
       active = false;
+      window.removeEventListener('offline', refresh);
+      window.removeEventListener('online', refresh);
       onlineSeen = false;
       transition(null, Date.now());
       visibleStatus = null;

@@ -3,6 +3,9 @@
 
   const HOUR = 3_600_000;
   const MAX_EVENTS = 1200;
+  const RESERVED_CRITICAL_EVENTS = MAX_EVENTS / 4;
+  const deliveryEvents = new Set(['notification_deferred', 'notification_cancelled', 'notification_api_result',
+    'notification_delivered', 'notification_retry']);
   const DUTY_MATCH_VERSION = 1;
   const engine = globalThis.ChatEngine;
   const referenceFields = ['chat_ref', 'episode_ref', 'notification_ref'];
@@ -14,12 +17,59 @@
     return s.shiftLogs ??= { active: null, pending: [] };
   }
 
-  function append(log, event) {
-    if (log.events.length >= MAX_EVENTS) {
-      log.events.splice(1, 1);
-      log.omitted += 1;
+  function retentionGroup({ event, details }) {
+    if (event === 'monitor_started' || event === 'shift_finished') return 'boundary';
+    if (event === 'connection_changed') return 'connection';
+    if (deliveryEvents.has(event) || (event === 'notification_decision' && details?.decision === 'queued')) {
+      return ['offline', 'connecting'].includes(details?.kind) ? 'connection' : 'delivery';
     }
-    log.events.push(event);
+    return 'regular';
+  }
+
+  function coalesceTime(events, entry) {
+    if (entry.event !== 'message_time_parsed' || !entry.details?.chat_ref) return false;
+    const hour = engine.calendarPeriodAt(entry.at);
+    const signature = JSON.stringify(entry.details);
+    const previous = events.findLast(candidate => candidate.event === entry.event &&
+      candidate.details?.chat_ref === entry.details.chat_ref && engine.calendarPeriodAt(candidate.at) === hour &&
+      JSON.stringify(candidate.details) === signature);
+    if (!previous) return false;
+    previous.lastAt = Math.max(previous.lastAt ?? previous.at, entry.lastAt ?? entry.at);
+    previous.at = Math.min(previous.at, entry.at);
+    previous.occurrences = (previous.occurrences ?? 1) + (entry.occurrences ?? 1);
+    return true;
+  }
+
+  function keepEvent(events, entry) {
+    if (coalesceTime(events, entry)) return;
+    let removed;
+    if (events.length >= MAX_EVENTS) {
+      const group = retentionGroup(entry);
+      const groups = events.map(retentionGroup);
+      let candidate = groups.indexOf('regular');
+      if (candidate < 0) {
+        if (group === 'regular') return entry;
+        // Connection and delivery retain independent space when the journal fills.
+        const connections = groups.filter(item => item === 'connection').length;
+        const deliveries = groups.filter(item => item === 'delivery').length;
+        if (group === 'boundary') {
+          candidate = groups.indexOf(connections > deliveries ? 'connection' : 'delivery');
+        } else {
+          const count = group === 'connection' ? connections : deliveries;
+          const other = groups.indexOf(group === 'connection' ? 'delivery' : 'connection');
+          candidate = other >= 0 && count < RESERVED_CRITICAL_EVENTS ? other : groups.indexOf(group);
+        }
+        candidate = Math.max(0, candidate);
+      }
+      [removed] = events.splice(candidate, 1);
+    }
+    events.push(entry);
+    return removed;
+  }
+
+  function append(log, event) {
+    const removed = keepEvent(log.events, event);
+    if (removed) log.omitted += removed.occurrences ?? 1;
   }
 
   function hold(owner, event) {
@@ -31,11 +81,8 @@
     if (event.event === 'notification_delivered' && !['offline', 'connecting'].includes(event.details?.kind)) {
       totals.notified += 1;
     }
-    if (held.events.length >= MAX_EVENTS) {
-      const removed = held.events.shift();
-      held.hours[engine.calendarPeriodAt(removed.at)].omitted += 1;
-    }
-    held.events.push(event);
+    const removed = keepEvent(held.events, event);
+    if (removed) held.hours[engine.calendarPeriodAt(removed.at)].omitted += removed.occurrences ?? 1;
   }
 
   function acceptBefore(log, cutoff) {
@@ -84,19 +131,37 @@
 
   function identifyChat(s, rowId, chatId) {
     const index = s.notificationLogIndex;
-    if (!index || !chatId || rowId === chatId) return;
+    if (!index || !rowId || !chatId || rowId === chatId) return;
     const rowKey = JSON.stringify(['chat', rowId]);
-    if (!index[rowKey]) return;
-    index[JSON.stringify(['chat', chatId])] ??= index[rowKey];
+    const oldRef = index[rowKey];
+    if (!oldRef) return;
+    const chatRef = index[JSON.stringify(['chat', chatId])] ??= oldRef;
     delete index[rowKey];
+    if (oldRef === chatRef) return;
+    const episodeRefs = new Map();
+    for (const [key, ref] of Object.entries(index)) {
+      const [type, owner, episode] = JSON.parse(key);
+      if (type !== 'episode' || owner !== oldRef) continue;
+      const canonical = index[JSON.stringify(['episode', chatRef, episode])] ??= ref;
+      episodeRefs.set(ref, canonical);
+      delete index[key];
+    }
+    const { active, review } = s.shiftLogs ?? {};
+    for (const buffer of [active, active?.held, review?.held]) {
+      for (const { details } of buffer?.events ?? []) {
+        if (details?.chat_ref !== oldRef) continue;
+        details.chat_ref = chatRef;
+        if (episodeRefs.has(details.episode_ref)) details.episode_ref = episodeRefs.get(details.episode_ref);
+      }
+    }
   }
 
   function parsedTime(s, at, refs, surface, stamp) {
     if (!timeSources.includes(stamp?.source)) return;
     const utc = Number.isSafeInteger(stamp.at) && Math.abs(stamp.at) <= 8.64e15 ? new Date(stamp.at).toISOString() : null;
     const rejected = [];
-    for (const item of Array.isArray(stamp.rejected) ? stamp.rejected.slice(0, 2) : []) {
-      if (!['datetime', 'title'].includes(item?.source) || !timeReasons.includes(item.reason)) continue;
+    for (const item of Array.isArray(stamp.rejected) ? stamp.rejected.slice(0, 3) : []) {
+      if (!timeSources.includes(item?.source) || !timeReasons.includes(item.reason)) continue;
       rejected.push({ source: item.source, reason: item.reason, delta_ms: Number.isSafeInteger(item.deltaMs) ? item.deltaMs : null });
     }
     diagnostic(s, at, 'message_time_parsed', refs, {
@@ -303,8 +368,10 @@
       `Проверено чатов: ${report.checked} · Уведомлений о чатах: ${report.notified}`,
       `Пропущено старых событий при переполнении журнала: ${report.omitted}`,
       '',
-      ...report.events.slice().sort((a, b) => a.at - b.at)
-        .map(({ at, event, details }) => `${utc(at)}  ${event}${details ? '  ' + JSON.stringify(details) : ''}`)
+      ...report.events.slice().sort((a, b) => a.at - b.at).map(({ at, event, details, occurrences, lastAt }) => {
+        const payload = occurrences > 1 ? { ...details, occurrences, last_seen_utc: utc(lastAt) } : details;
+        return `${utc(at)}  ${event}${payload ? '  ' + JSON.stringify(payload) : ''}`;
+      })
     ];
     return '\uFEFF' + lines.join('\n') + '\n';
   }

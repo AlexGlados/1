@@ -77,7 +77,7 @@ const header = 'День,Час,Старший,Итого,Веб,Иван Пет
 const csv = header + '\nпятница,16:00,,1,,Иван Петров';
 
 function schedule({ settings = config, index = week, body = csv, network } = {}) {
-  return load('schedule.js', {
+  const context = load('identity.js', {
     AbortSignal,
     chrome: { runtime: { getURL: file => 'chrome-extension://fixture/' + file } },
     fetch: async url => {
@@ -85,7 +85,9 @@ function schedule({ settings = config, index = week, body = csv, network } = {})
       if (network) return network();
       return { ok: true, text: async () => url.includes('/htmlview') ? index : body };
     }
-  }).ShSchedule;
+  });
+  vm.runInContext(readFileSync(join(__dirname, '../chrome/schedule.js'), 'utf8'), context, { filename: 'schedule.js' });
+  return context.ShSchedule;
 }
 
 test('schedule diagnostics classify fixed failures without accepting arbitrary external codes', async () => {
@@ -100,7 +102,11 @@ test('schedule diagnostics classify fixed failures without accepting arbitrary e
     ['schedule_csv', { body: '"' + csv }],
     ['schedule_hour_missing', { body: header }],
     ['schedule_hour_ambiguous', { body: csv + '\nпятница,16:00,,1,,Иван Петров' }],
-    ['schedule_roster', { body: header + '\nпятница,16:00,,2,,Иван Петров' }]
+    ['schedule_roster', { body: 'День,Час,Иван Петров\nпятница,16:00,Иван Петров' }],
+    ['schedule_roster', { body: 'День,Час,Итого,Итого,Иван Петров\nпятница,16:00,1,1,Иван Петров' }],
+    ['schedule_roster', { body: header + '\nпятница,16:00,,2,,Иван Петров' }],
+    ['schedule_roster', { body: header + '\nпятница,16:00,,0,' }],
+    ['schedule_roster', { body: header + '\nпятница,16:00,,1,,Фёдор Орлов' }]
   ];
   for (const [code, setup] of scenarios) {
     const S = schedule(setup);
@@ -110,4 +116,46 @@ test('schedule diagnostics classify fixed failures without accepting arbitrary e
   assert.equal(S.errorCode({ code: 'schedule_network', message: 'private' }), 'schedule_unknown');
   await assert.rejects(S.read('2026-11-31', 16), error => S.errorCode(error) === 'schedule_request');
   assert.deepEqual(Array.from((await S.read(DATE, 16)).names), [CURATOR]);
+});
+
+test('ignored role cells do not count as personal assignments', async () => {
+  const S = schedule({ body: header + ',Фёдор Орлов\n' +
+    'пятница,16:00,Фёдор Орлов,1,Другой Куратор,Иван Петров,\n' +
+    'пятница,17:00,Фёдор Орлов,0,Другой Куратор,,' });
+  const roster = await S.read(DATE, 16);
+  assert.deepEqual(Array.from(roster.names), [CURATOR]);
+  assert.deepEqual(Array.from(roster.directory), [CURATOR, 'Фёдор Орлов']);
+  assert.equal(E.curatorDuty({ curatorName: 'Фёдор Орлов' }, roster.names, roster.directory), false);
+  assert.deepEqual(Array.from((await S.read(DATE, 17)).names), []);
+});
+
+test('optional role columns can be absent, unlabelled, or moved without affecting the roster', async () => {
+  const scenarios = [
+    ['День,Час,Итого,Иван Петров', 'пятница,16:00,1,Иван Петров'],
+    ['День,Час,,Итого,,Иван Петров', 'пятница,16:00,Фёдор Орлов,1,служебное значение,Иван Петров'],
+    ['ВЕБ,Час,Итого,Иван Петров,День,Старший', 'не используется,16:00,1,Иван Петров,пятница,Фёдор Орлов']
+  ];
+  for (const [columns, row] of scenarios) {
+    const result = await schedule({ body: columns + '\n' + row }).read(DATE, 16);
+    assert.deepEqual(Array.from(result.names), [CURATOR], columns);
+    assert.deepEqual(Array.from(result.directory), [CURATOR], columns);
+  }
+});
+
+test('normalized duplicate personal headers reject the hour even if only one is filled', async () => {
+  for (const [total, marked] of [[2, 'Орлов Федор'], [1, '']]) {
+    const S = schedule({ body: 'День,Час,Старший,Итого,Веб,Фёдор Орлов,Орлов Федор\n' +
+      'пятница,16:00,,' + total + ',,Фёдор Орлов,' + marked });
+    await assert.rejects(S.read(DATE, 16), error => S.errorCode(error) === 'schedule_duplicate_curator');
+  }
+});
+
+test('roster names use the curator identity normalization for apostrophes and hyphens', async () => {
+  const name = "Иван О'Коннор‐Орлов";
+  const S = schedule({ body: 'День,Час,Старший,Итого,Веб,' + name +
+    '\nпятница,16:00,,1,,О’Коннор-Орлов Иван' });
+  const result = await S.read(DATE, 16);
+  assert.deepEqual(Array.from(result.names), [name]);
+  const { ShkolkovoIdentity: identity } = load('identity.js');
+  assert.equal(identity.matches(identity.parse({ firstName: 'иван', lastName: 'О’Коннор-Орлов' }), result.names[0]), true);
 });

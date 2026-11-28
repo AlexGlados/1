@@ -108,7 +108,7 @@ test('reordering one chat between virtual frames withholds the head watermark', 
     ? [row(ROW_A, 1)]
     : [row(ROW_A, 2), row(ROW_C, 3)]);
 
-  await f.api.reportHead(f.root, AT - MINUTE, AT + MINUTE, true);
+  await f.api.reportHead(f.root, AT + MINUTE, true);
 
   const unstable = captures(f).at(-1);
   assert.deepEqual(Array.from(unstable.rows, item => item.id).sort(), [ROW_A, ROW_C]);
@@ -117,7 +117,7 @@ test('reordering one chat between virtual frames withholds the head watermark', 
   f.render(scroll => scroll === 0
     ? [row(ROW_A, 1), row(ROW_B, 2)]
     : [row(ROW_B, 2), row(ROW_C, 3)]);
-  await f.api.reportHead(f.root, AT - MINUTE, AT + MINUTE, true);
+  await f.api.reportHead(f.root, AT + MINUTE, true);
 
   const stable = captures(f).at(-1);
   assert.deepEqual(Array.from(stable.rows, item => item.id).sort(), [ROW_A, ROW_B, ROW_C]);
@@ -129,7 +129,7 @@ test('a changed row at the same position interrupts coverage across overlapping 
     ? [row(ROW_A, 1), row(ROW_B, 2)]
     : [row(ROW_D, 2), row(ROW_C, 3)]);
 
-  await f.api.reportHead(f.root, AT - MINUTE, AT + MINUTE, true);
+  await f.api.reportHead(f.root, AT + MINUTE, true);
 
   const capture = captures(f).at(-1);
   assert.ok(capture.rows.some(item => item.id === ROW_D));
@@ -144,11 +144,37 @@ test('a changed head while returning to the top also withholds the watermark', a
     return [row(ROW_B, 2), row(ROW_C, 3)];
   });
 
-  await f.api.reportHead(f.root, AT - MINUTE, AT + MINUTE, true);
+  await f.api.reportHead(f.root, AT + MINUTE, true);
 
   const capture = captures(f).at(-1);
   assert.ok(capture.rows.some(item => item.id === ROW_D));
   assert.equal(Object.hasOwn(capture, 'headThrough'), false);
+});
+
+test('regular monitoring follows positions to an unchanged row in the previous head', async () => {
+  const first = row(ROW_A, 1, AT + 20_000);
+  const f = fixture(3, scroll => scroll === 0 ? [first, row(ROW_B, 2)] : [row(ROW_B, 2), row(ROW_C, 3)]);
+  await f.api.reportHead(f.root, AT + MINUTE, true);
+  assert.ok(captures(f).at(-1).rows.some(item => item.id === ROW_C));
+
+  f.setTotal(4);
+  f.render(scroll => scroll === 0 ? [first, row(ROW_D, 2, AT + 10_000)] :
+    scroll <= 75 ? [row(ROW_D, 2, AT + 10_000), row(ROW_B, 3)] : [row(ROW_B, 3), row(ROW_C, 4)]);
+  await f.api.reportHead(f.root, AT + MINUTE, true);
+  const capture = captures(f).at(-1);
+  assert.deepEqual(Array.from(capture.rows, item => item.id).sort(), [ROW_A, ROW_B, ROW_D]);
+  assert.equal(capture.headThrough, AT + MINUTE);
+});
+
+test('regular monitoring bypasses the old head anchor once the list order is contradicted', async () => {
+  const old = row(ROW_A, 1, AT - 50 * MINUTE);
+  const f = fixture(2, scroll => scroll === 0 ? [old] : [row(ROW_B, 2)]);
+  await f.api.reportHead(f.root, AT + MINUTE, true);
+  f.render(scroll => scroll === 0 ? [old] : [row(ROW_C, 2, AT + 1000)]);
+  await f.api.reportHead(f.root, AT + MINUTE, true);
+  const capture = captures(f).at(-1);
+  assert.ok(capture.rows.some(item => item.id === ROW_C));
+  assert.equal(capture.headThrough, AT + MINUTE);
 });
 
 test('targeted search continues past a minute-precision row in the target minute', async () => {
@@ -156,50 +182,77 @@ test('targeted search continues past a minute-precision row in the target minute
     ? [row(ROW_A, 1, MINUTE_START, 'minute')]
     : [row(ROW_B, 2)]);
   const result = await f.api.seekRow(
-    ROW_B, undefined, new AbortController().signal, () => true, AT + 2 * MINUTE, AT - MINUTE, AT
+    ROW_B, undefined, new AbortController().signal, () => true, AT + 2 * MINUTE, AT - MINUTE
   );
 
   assert.equal(result?.key, ROW_B);
 });
 
-test('targeted search reports a distinct reason when it reaches older rows', async () => {
+test('targeted search reports a time boundary for a verified older target', async () => {
   const f = fixture(2, scroll => scroll === 0
     ? [row(ROW_A, 1, MINUTE_START - MINUTE, 'minute')]
     : [row(ROW_B, 2, MINUTE_START - 2 * MINUTE, 'minute')]);
   const search = {};
 
   const result = await f.api.seekRow(
-    ROW_C, undefined, new AbortController().signal, () => true, AT + 2 * MINUTE, AT - 5 * MINUTE, AT, search
+    ROW_B, undefined, new AbortController().signal, () => true, AT + 2 * MINUTE, AT, search
   );
 
   assert.equal(result, null);
   assert.equal(search.reasonCode, 'row_time_boundary');
-  const reply = await f.api.read({ id: ROW_C, session: 'fixture-session', expiresAt: AT + 2 * MINUTE,
-    job: { rowKey: ROW_C, at: AT, minActivityAt: AT - 5 * MINUTE } });
+  const reply = await f.api.read({ id: ROW_B, session: 'fixture-session', expiresAt: AT + 2 * MINUTE,
+    job: { rowKey: ROW_B, at: AT, minActivityAt: AT } });
   assert.equal(reply.ready, false);
   assert.equal(reply.reasonCode, 'row_time_boundary');
 });
 
-test('targeted search reopens a gap above the older boundary before stopping', async () => {
+test('targeted search reaches a fresh row below an older viewport', async () => {
+  const f = fixture(2, scroll => scroll === 0
+    ? [row(ROW_A, 1, MINUTE_START - 45 * MINUTE)]
+    : [row(ROW_B, 2)]);
+  const search = {};
+  const result = await f.api.seekRow(
+    ROW_B, undefined, new AbortController().signal, () => true, AT + 2 * MINUTE, AT - MINUTE, search
+  );
+  assert.equal(result?.key, ROW_B);
+  assert.equal(search.reasonCode, undefined);
+});
+
+test('targeted search reopens a gap before treating the covered range as exhausted', async () => {
   const f = fixture(3, scroll => scroll === 0
     ? [row(ROW_A, 1, AT + 1), row(ROW_C, 3, MINUTE_START - MINUTE)]
     : [row(ROW_B, 2), row(ROW_C, 3, MINUTE_START - MINUTE)]);
   const search = {};
   const result = await f.api.seekRow(
-    ROW_B, undefined, new AbortController().signal, () => true, AT + 2 * MINUTE, AT - MINUTE, AT, search
+    ROW_B, undefined, new AbortController().signal, () => true, AT + 2 * MINUTE, AT - MINUTE, search
   );
 
   assert.equal(result?.key, ROW_B);
   assert.equal(search.reasonCode, undefined);
 });
 
-test('targeted search distinguishes an inaccessible gap from a verified time boundary', async () => {
+test('targeted search reports an inaccessible gap inside the positional range', async () => {
   const f = fixture(3, () => [row(ROW_A, 1, AT + 1), row(ROW_C, 3, MINUTE_START - MINUTE)]);
   const reply = await f.api.read({ id: ROW_B, session: 'fixture-session', expiresAt: AT + 2 * MINUTE,
     job: { rowKey: ROW_B, at: AT, minActivityAt: AT - 5 * MINUTE } });
 
   assert.equal(reply.ready, false);
   assert.equal(reply.reasonCode, 'row_range_unavailable');
+});
+
+test('startup queues a fresh row after an old one and reports missing trailing positions', async () => {
+  const old = row(ROW_A, 1, AT - 50 * MINUTE);
+  const f = fixture(3, scroll => scroll === 0 ? [old] : [row(ROW_B, 2)]);
+  const partial = await f.api.surveyInitial(AT - 45 * MINUTE, new AbortController(), () => true);
+  assert.equal(partial.complete, false);
+  assert.equal(partial.skipped, 1);
+  assert.deepEqual(Array.from(partial.rows, item => item.id), [ROW_B]);
+
+  f.render(scroll => scroll === 0 ? [old] : [row(ROW_B, 2), row(ROW_C, 3)]);
+  const complete = await f.api.surveyInitial(AT - 45 * MINUTE, new AbortController(), () => true);
+  assert.equal(complete.complete, true);
+  assert.equal(complete.skipped, 0);
+  assert.deepEqual(Array.from(complete.rows, item => item.id), [ROW_B, ROW_C]);
 });
 
 test('startup includes the minute that overlaps the cutoff and scans the following row', async () => {
@@ -317,7 +370,7 @@ test('a concurrent read blocks the tab and completing the first read emits an ex
 
   assert.equal(parallel.blocked, true);
   assert.equal(parallel.tabBlock, 'read_busy');
-  assert.equal((await first).reasonCode, 'row_time_boundary');
+  assert.equal((await first).reasonCode, 'row_unavailable');
   assert.ok(f.messages.some(message => message.type === 'monitor:wake' && message.readReady));
 });
 
